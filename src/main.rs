@@ -55,6 +55,9 @@ enum Commands {
         /// Path to the PST file
         #[arg(required = true)]
         file: PathBuf,
+        /// Enable debug/diagnostic mode: logs events to pstexplorer-debug.log
+        #[arg(long)]
+        debug: bool,
     },
 }
 
@@ -220,7 +223,7 @@ struct AppState {
     current_folder: Rc<UnicodeFolder>,
     folder_list_state: ListState,
     message_list_state: ListState,
-    folders: Vec<(String, usize)>,
+    folders: Vec<(String, usize, bool)>,
     messages: Vec<String>,
     current_message_content: String,
     current_headers: MessageHeaders,
@@ -229,6 +232,10 @@ struct AppState {
     /// The folder whose messages are currently shown in the message list.
     /// Differs from current_folder when hovering over a subfolder.
     messages_folder: Rc<UnicodeFolder>,
+    /// Debug event log; None if debug mode not enabled.
+    debug_log: Option<Vec<String>>,
+    /// Transient status bar message (cleared on next keypress).
+    status_message: Option<String>,
 }
 
 impl PstBrowser {
@@ -238,7 +245,7 @@ impl PstBrowser {
 }
 
 impl AppState {
-    fn new(browser: &PstBrowser) -> Self {
+    fn new(browser: &PstBrowser, debug: bool) -> Self {
         let folders = Self::get_folders(browser, &browser.root_folder);
 
         // Show messages from the first subfolder (if any), otherwise root folder.
@@ -279,10 +286,18 @@ impl AppState {
             active_pane: ActivePane::Folders,
             preview_scroll: 0,
             messages_folder,
+            debug_log: if debug { Some(vec![]) } else { None },
+            status_message: None,
         }
     }
 
-    fn get_folders(browser: &PstBrowser, folder: &UnicodeFolder) -> Vec<(String, usize)> {
+    fn log_event(&mut self, msg: &str) {
+        if let Some(log) = &mut self.debug_log {
+            log.push(msg.to_string());
+        }
+    }
+
+    fn get_folders(browser: &PstBrowser, folder: &UnicodeFolder) -> Vec<(String, usize, bool)> {
         folder
             .hierarchy_table()
             .map(|table| {
@@ -301,7 +316,11 @@ impl AppState {
                             .contents_table()
                             .map(|t| t.rows_matrix().count())
                             .unwrap_or(0);
-                        Some((name, count))
+                        let has_subfolders = subfolder
+                            .hierarchy_table()
+                            .map(|t| t.rows_matrix().next().is_some())
+                            .unwrap_or(false);
+                        Some((name, count, has_subfolders))
                     })
                     .collect()
             })
@@ -338,20 +357,21 @@ impl AppState {
             .map(|table| {
                 table
                     .rows_matrix()
-                    .filter_map(|row| {
-                        let entry_id = browser
+                    .map(|row| {
+                        let entry_id = match browser
                             .store
                             .properties()
                             .make_entry_id(NodeId::from(u32::from(row.id())))
-                            .ok()?;
-                        let message = UnicodeMessage::read(
+                        {
+                            Ok(eid) => eid,
+                            Err(e) => return format!("(entry id error: {})", e),
+                        };
+                        match UnicodeMessage::read(
                             Rc::clone(&browser.store),
                             &entry_id,
                             Some(&[0x0037]),
-                        )
-                        .ok()?;
-                        Some(
-                            message
+                        ) {
+                            Ok(message) => message
                                 .properties()
                                 .get(0x0037)
                                 .and_then(|v| match v {
@@ -360,7 +380,8 @@ impl AppState {
                                     _ => None,
                                 })
                                 .unwrap_or_else(|| "(no subject)".to_string()),
-                        )
+                            Err(e) => format!("(unreadable: {})", e),
+                        }
                     })
                     .collect()
             })
@@ -500,7 +521,7 @@ impl AppState {
     }
 }
 
-fn browse_pst(file_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn browse_pst(file_path: &PathBuf, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Open the PST file
     let pst = UnicodePstFile::open(file_path)?;
     let pst_rc = Rc::new(pst);
@@ -519,7 +540,7 @@ fn browse_pst(file_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             if execute!(stdout, EnterAlternateScreen).is_ok() {
                 let backend = CrosstermBackend::new(stdout);
                 if let Ok(mut terminal) = Terminal::new(backend) {
-                    let mut app_state = AppState::new(&browser);
+                    let mut app_state = AppState::new(&browser, debug);
 
                     // Main loop
                     while !app_state.exit {
@@ -533,6 +554,12 @@ fn browse_pst(file_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("Error handling events: {}", e);
                             break;
                         }
+                    }
+
+                    // Write debug log if enabled
+                    if let Some(log) = &app_state.debug_log {
+                        let content = log.join("\n") + "\n";
+                        let _ = std::fs::write("pstexplorer-debug.log", content);
                     }
 
                     // Cleanup
@@ -578,13 +605,21 @@ fn draw_ui(frame: &mut ratatui::Frame, _browser: &PstBrowser, state: &mut AppSta
     draw_folder_list(frame, state, main_layout[0]);
     draw_messages_pane(frame, state, main_layout[1]);
 
-    let help = match state.active_pane {
-        ActivePane::Folders => " [Folders] j/k: navigate  Enter/l: open  h: back  Tab: → messages  q: quit",
-        ActivePane::Messages => " [Messages] j/k: navigate  Enter: view  Tab: → preview  q: quit",
-        ActivePane::Preview => " [Preview] j/k: scroll  Tab: → folders  q: quit",
+    let status_text = if let Some(msg) = &state.status_message {
+        msg.clone()
+    } else {
+        match state.active_pane {
+            ActivePane::Folders => " [Folders] j/k: navigate  Enter/l: open  h: back  Tab: → messages  D: dump state  q: quit".to_string(),
+            ActivePane::Messages => " [Messages] j/k: navigate  Enter: view  Tab: → preview  D: dump state  q: quit".to_string(),
+            ActivePane::Preview => " [Preview] j/k: scroll  Tab: → folders  D: dump state  q: quit".to_string(),
+        }
     };
-    let status = ratatui::widgets::Paragraph::new(help)
-        .style(Style::default().fg(ratatui::style::Color::DarkGray));
+    let status_style = if state.status_message.is_some() {
+        Style::default().fg(ratatui::style::Color::Green)
+    } else {
+        Style::default().fg(ratatui::style::Color::DarkGray)
+    };
+    let status = ratatui::widgets::Paragraph::new(status_text).style(status_style);
     frame.render_widget(status, layout[1]);
 }
 
@@ -598,7 +633,16 @@ fn draw_folder_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect
     let items: Vec<ListItem> = state
         .folders
         .iter()
-        .map(|(name, count)| ListItem::new(format!("{} ({})", name, count)))
+        .map(|(name, count, has_sub)| {
+            let label = if *has_sub && *count == 0 {
+                format!("▶ {}", name)
+            } else if *has_sub {
+                format!("▶ {} ({})", name, count)
+            } else {
+                format!("{} ({})", name, count)
+            };
+            ListItem::new(label)
+        })
         .collect();
 
     let border_style = if state.active_pane == ActivePane::Folders {
@@ -727,6 +771,33 @@ fn handle_events(
         && let Event::Key(key) = event::read()?
         && key.kind == KeyEventKind::Press
     {
+        // Clear transient status message on any keypress
+        state.status_message = None;
+
+        // Log keypress if debug mode enabled
+        let pane_name = match state.active_pane {
+            ActivePane::Folders => "Folders",
+            ActivePane::Messages => "Messages",
+            ActivePane::Preview => "Preview",
+        };
+        let folder_idx = state.folder_list_state.selected().unwrap_or(0);
+        let msg_idx = state.message_list_state.selected().unwrap_or(0);
+        let key_str = match key.code {
+            KeyCode::Char(c) => format!("'{}'", c),
+            KeyCode::Enter => "Enter".to_string(),
+            KeyCode::Tab => "Tab".to_string(),
+            KeyCode::Esc => "Esc".to_string(),
+            KeyCode::Up => "Up".to_string(),
+            KeyCode::Down => "Down".to_string(),
+            KeyCode::Left => "Left".to_string(),
+            KeyCode::Right => "Right".to_string(),
+            _ => format!("{:?}", key.code),
+        };
+        state.log_event(&format!(
+            "[KEY] {} | pane={} folder_idx={} msg_idx={} scroll={}",
+            key_str, pane_name, folder_idx, msg_idx, state.preview_scroll
+        ));
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => state.exit = true,
             KeyCode::Tab => {
@@ -811,6 +882,58 @@ fn handle_events(
                     ActivePane::Preview => {}
                 }
             }
+            KeyCode::Char('D') => {
+                let folder_name = state
+                    .current_folder
+                    .properties()
+                    .display_name()
+                    .unwrap_or_else(|_| "?".to_string());
+                let messages_folder_name = state
+                    .messages_folder
+                    .properties()
+                    .display_name()
+                    .unwrap_or_else(|_| "?".to_string());
+                let raw_row_count = state
+                    .messages_folder
+                    .contents_table()
+                    .map(|t| t.rows_matrix().count())
+                    .unwrap_or(0);
+                let pane = match state.active_pane {
+                    ActivePane::Folders => "Folders",
+                    ActivePane::Messages => "Messages",
+                    ActivePane::Preview => "Preview",
+                };
+                let dump = format!(
+                    "=== pstexplorer state dump ===\n\
+                     active_pane:       {}\n\
+                     current_folder:    {} ({} subfolders)\n\
+                     messages_folder:   {} (raw rows={} displayed={})\n\
+                     folder_idx:        {:?}\n\
+                     message_idx:       {:?}\n\
+                     preview_scroll:    {}\n\
+                     debug_mode:        {}\n",
+                    pane,
+                    folder_name,
+                    state.folders.len(),
+                    messages_folder_name,
+                    raw_row_count,
+                    state.messages.len(),
+                    state.folder_list_state.selected(),
+                    state.message_list_state.selected(),
+                    state.preview_scroll,
+                    state.debug_log.is_some(),
+                );
+                let dump_path = "pstexplorer-state-dump.txt";
+                match std::fs::write(dump_path, &dump) {
+                    Ok(_) => {
+                        state.log_event(&format!("[DUMP] State dumped to {}", dump_path));
+                        state.status_message = Some(format!(" State dumped to {}", dump_path));
+                    }
+                    Err(e) => {
+                        state.status_message = Some(format!(" Dump failed: {}", e));
+                    }
+                }
+            }
             KeyCode::Char('h') | KeyCode::Left => {
                 state.current_folder = Rc::clone(&browser.root_folder);
                 state.folders = AppState::get_folders(browser, &state.current_folder);
@@ -849,8 +972,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Browse { file } => {
-            if let Err(e) = browse_pst(file) {
+        Commands::Browse { file, debug } => {
+            if let Err(e) = browse_pst(file, *debug) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
