@@ -148,6 +148,15 @@ enum Commands {
         #[arg(required = true)]
         file: PathBuf,
     },
+    /// Search emails in a PST file by query string (matches from, to, cc, body)
+    Search {
+        /// Path to the PST file
+        #[arg(required = true)]
+        file: PathBuf,
+        /// Search query (case-insensitive, matched against from, to, cc, and body)
+        #[arg(required = true)]
+        query: String,
+    },
     /// Browse PST file contents in a TUI
     Browse {
         /// Path to the PST file
@@ -188,6 +197,128 @@ fn list_emails(file_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nFound {} emails in the PST file", total_emails);
 
     Ok(())
+}
+
+fn search_emails(file_path: &PathBuf, query: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let query_lower = query.to_ascii_lowercase();
+    let pst = UnicodePstFile::open(file_path)?;
+    let store = Rc::new(UnicodeStore::read(Rc::new(pst))?);
+    let ipm_sub_tree_entry_id = store.properties().ipm_sub_tree_entry_id()?;
+    let ipm_subtree_folder = outlook_pst::messaging::folder::UnicodeFolder::read(
+        Rc::clone(&store),
+        &ipm_sub_tree_entry_id,
+    )?;
+    let total = search_traverse_folders(Rc::clone(&store), &ipm_subtree_folder, &query_lower)?;
+    println!("\nFound {} matching emails", total);
+    Ok(())
+}
+
+fn search_traverse_folders(
+    store: Rc<UnicodeStore>,
+    folder: &outlook_pst::messaging::folder::UnicodeFolder,
+    query_lower: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut match_count = 0;
+
+    let folder_name = folder
+        .properties()
+        .display_name()
+        .unwrap_or_else(|_| "Unknown".to_string());
+
+    if let Some(contents_table) = folder.contents_table() {
+        for message_row in contents_table.rows_matrix() {
+            let message_entry_id = store
+                .properties()
+                .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
+                    message_row.id(),
+                )))?;
+
+            if let Ok(message) = outlook_pst::messaging::message::UnicodeMessage::read(
+                store.clone(),
+                &message_entry_id,
+                // Subject, From, To, CC, Received Time, Plain body, HTML body, RTF body
+                Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0E06, 0x1000, 0x1013, 0x1009]),
+            ) {
+                let props = message.properties();
+
+                let get_str = |id: u16| -> String {
+                    props
+                        .get(id)
+                        .and_then(|v| match v {
+                            PropertyValue::String8(s) => Some(s.to_string()),
+                            PropertyValue::Unicode(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                        .unwrap_or_default()
+                };
+
+                let from = get_str(0x0C1A);
+                let to = get_str(0x0E04);
+                let cc = get_str(0x0E02);
+                let subject = get_str(0x0037);
+
+                // Resolve body: plain text, then HTML, then RTF
+                let get_str_prop = |id: u16| -> Option<String> {
+                    props.get(id).and_then(|v| match v {
+                        PropertyValue::String8(s) => Some(s.to_string()),
+                        PropertyValue::Unicode(s) => Some(s.to_string()),
+                        _ => None,
+                    })
+                };
+                let body = if let Some(s) = get_str_prop(0x1000) {
+                    s
+                } else if let Some(html) = get_str_prop(0x1013) {
+                    html_to_text(&html)
+                } else if let Some(PropertyValue::Binary(rtf)) = props.get(0x1009) {
+                    rtf_compressed_to_text(rtf.buffer()).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                let matches = [&from, &to, &cc, &body]
+                    .iter()
+                    .any(|s| s.to_ascii_lowercase().contains(query_lower));
+
+                if matches {
+                    let date = props
+                        .get(0x0E06)
+                        .and_then(|v| match v {
+                            PropertyValue::Time(t) => Some(filetime_to_string(*t)),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+
+                    println!("Folder:  {}", folder_name);
+                    println!("Subject: {}", subject);
+                    println!("From:    {}", from);
+                    println!("To:      {}", to);
+                    if !cc.is_empty() {
+                        println!("CC:      {}", cc);
+                    }
+                    println!("Date:    {}", date);
+                    println!("---");
+                    match_count += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(hierarchy_table) = folder.hierarchy_table() {
+        for subfolder_row in hierarchy_table.rows_matrix() {
+            let subfolder_entry_id = store
+                .properties()
+                .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
+                    subfolder_row.id(),
+                )))?;
+            let subfolder = outlook_pst::messaging::folder::UnicodeFolder::read(
+                store.clone(),
+                &subfolder_entry_id,
+            )?;
+            match_count += search_traverse_folders(store.clone(), &subfolder, query_lower)?;
+        }
+    }
+
+    Ok(match_count)
 }
 
 fn traverse_folder_hierarchy(
@@ -1112,6 +1243,12 @@ fn main() {
     match &cli.command {
         Commands::List { file } => {
             if let Err(e) = list_emails(file) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Search { file, query } => {
+            if let Err(e) = search_emails(file, query) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
