@@ -14,7 +14,8 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use std::{io, path::PathBuf, rc::Rc};
@@ -184,6 +185,15 @@ struct PstBrowser {
     root_folder: Rc<UnicodeFolder>,
 }
 
+#[derive(Default)]
+struct MessageHeaders {
+    from: String,
+    to: String,
+    cc: String,
+    subject: String,
+    date: String,
+}
+
 #[derive(PartialEq)]
 enum ActivePane {
     Folders,
@@ -199,6 +209,7 @@ struct AppState {
     folders: Vec<String>,
     messages: Vec<String>,
     current_message_content: String,
+    current_headers: MessageHeaders,
     active_pane: ActivePane,
     preview_scroll: u16,
 }
@@ -227,6 +238,7 @@ impl AppState {
             folders,
             messages,
             current_message_content,
+            current_headers: MessageHeaders::default(),
             active_pane: ActivePane::Folders,
             preview_scroll: 0,
         }
@@ -317,6 +329,7 @@ impl AppState {
                 let (messages, content) = Self::get_messages(browser, &self.current_folder);
                 self.messages = messages;
                 self.current_message_content = content;
+                self.current_headers = MessageHeaders::default();
                 let mut folder_state = ListState::default();
                 if !self.folders.is_empty() {
                     folder_state.select(Some(0));
@@ -345,8 +358,37 @@ impl AppState {
                 && let Ok(message) =
                     UnicodeMessage::read(Rc::clone(&browser.store), &entry_id, None)
             {
-                self.current_message_content = message
-                    .properties()
+                let props = message.properties();
+
+                let get_str = |id: u16| -> String {
+                    props
+                        .get(id)
+                        .and_then(|v| match v {
+                            PropertyValue::String8(s) => Some(s.to_string()),
+                            PropertyValue::Unicode(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                        .unwrap_or_default()
+                };
+
+                let date = props
+                    .get(0x0039)
+                    .or_else(|| props.get(0x0E06))
+                    .and_then(|v| match v {
+                        PropertyValue::Time(t) => Some(t.to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+
+                self.current_headers = MessageHeaders {
+                    subject: get_str(0x0037),
+                    from: get_str(0x0C1A),
+                    to: get_str(0x0E04),
+                    cc: get_str(0x0E02),
+                    date,
+                };
+
+                self.current_message_content = props
                     .get(0x1000)
                     .and_then(|value| match value {
                         PropertyValue::String8(s) => Some(s.to_string()),
@@ -354,28 +396,18 @@ impl AppState {
                         _ => None,
                     })
                     .or_else(|| {
-                        message
-                            .properties()
-                            .get(0x1013)
-                            .and_then(|value| match value {
-                                PropertyValue::Binary(b) => {
-                                    String::from_utf8(b.buffer().to_vec()).ok()
-                                }
-                                PropertyValue::String8(s) => Some(s.to_string()),
-                                PropertyValue::Unicode(s) => Some(s.to_string()),
-                                _ => None,
-                            })
+                        props.get(0x1013).and_then(|value| match value {
+                            PropertyValue::Binary(b) => String::from_utf8(b.buffer().to_vec()).ok(),
+                            PropertyValue::String8(s) => Some(s.to_string()),
+                            PropertyValue::Unicode(s) => Some(s.to_string()),
+                            _ => None,
+                        })
                     })
                     .or_else(|| {
-                        message
-                            .properties()
-                            .get(0x1009)
-                            .and_then(|value| match value {
-                                PropertyValue::Binary(b) => {
-                                    String::from_utf8(b.buffer().to_vec()).ok()
-                                }
-                                _ => None,
-                            })
+                        props.get(0x1009).and_then(|value| match value {
+                            PropertyValue::Binary(b) => String::from_utf8(b.buffer().to_vec()).ok(),
+                            _ => None,
+                        })
                     })
                     .unwrap_or_else(|| "No message content available".to_string());
                 self.preview_scroll = 0;
@@ -556,14 +588,48 @@ fn draw_message_preview(frame: &mut ratatui::Frame, state: &AppState, area: Rect
         Style::default()
     };
 
-    let preview = Paragraph::new(state.current_message_content.as_str())
+    let label_style = Style::default()
+        .fg(ratatui::style::Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let value_style = Style::default();
+
+    let h = &state.current_headers;
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("From:    ", label_style),
+            Span::styled(h.from.clone(), value_style),
+        ]),
+        Line::from(vec![
+            Span::styled("To:      ", label_style),
+            Span::styled(h.to.clone(), value_style),
+        ]),
+        Line::from(vec![
+            Span::styled("CC:      ", label_style),
+            Span::styled(h.cc.clone(), value_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Subject: ", label_style),
+            Span::styled(h.subject.clone(), value_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Date:    ", label_style),
+            Span::styled(h.date.clone(), value_style),
+        ]),
+        Line::from("─".repeat(area.width.saturating_sub(2) as usize)),
+    ];
+
+    for line in state.current_message_content.lines() {
+        lines.push(Line::from(line.to_string()));
+    }
+
+    let preview = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
                 .title("Message Preview"),
         )
-        .wrap(ratatui::widgets::Wrap { trim: true })
+        .wrap(ratatui::widgets::Wrap { trim: false })
         .scroll((state.preview_scroll, 0));
 
     frame.render_widget(preview, area);
