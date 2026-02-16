@@ -1,1 +1,5 @@
 /target
+
+.claude
+pstexplorer-debug.log
+pstexplorer-state-dump.txt
