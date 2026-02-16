@@ -18,7 +18,21 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
+use chrono::{TimeZone, Utc};
 use std::{io, path::PathBuf, rc::Rc};
+
+/// Convert a Windows FILETIME (100-ns ticks since 1601-01-01 UTC) to a
+/// human-readable UTC string, e.g. "2010-11-24 15:24:27 UTC".
+fn filetime_to_string(ticks: i64) -> String {
+    // Seconds between 1601-01-01 and 1970-01-01
+    const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
+    let secs = ticks / 10_000_000 - EPOCH_DIFF_SECS;
+    let nanos = ((ticks % 10_000_000) * 100) as u32;
+    match Utc.timestamp_opt(secs, nanos) {
+        chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        _ => format!("(invalid: {})", ticks),
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "pstexplorer")]
@@ -206,12 +220,15 @@ struct AppState {
     current_folder: Rc<UnicodeFolder>,
     folder_list_state: ListState,
     message_list_state: ListState,
-    folders: Vec<String>,
+    folders: Vec<(String, usize)>,
     messages: Vec<String>,
     current_message_content: String,
     current_headers: MessageHeaders,
     active_pane: ActivePane,
     preview_scroll: u16,
+    /// The folder whose messages are currently shown in the message list.
+    /// Differs from current_folder when hovering over a subfolder.
+    messages_folder: Rc<UnicodeFolder>,
 }
 
 impl PstBrowser {
@@ -223,7 +240,27 @@ impl PstBrowser {
 impl AppState {
     fn new(browser: &PstBrowser) -> Self {
         let folders = Self::get_folders(browser, &browser.root_folder);
-        let (messages, current_message_content) = Self::get_messages(browser, &browser.root_folder);
+
+        // Show messages from the first subfolder (if any), otherwise root folder.
+        // Also keep track of which folder is being shown so select_message is correct.
+        let messages_folder: Rc<UnicodeFolder> = if !folders.is_empty() {
+            browser
+                .root_folder
+                .hierarchy_table()
+                .and_then(|t| t.rows_matrix().next())
+                .and_then(|row| {
+                    let entry_id = browser
+                        .store
+                        .properties()
+                        .make_entry_id(NodeId::from(u32::from(row.id())))
+                        .ok()?;
+                    UnicodeFolder::read(Rc::clone(&browser.store), &entry_id).ok()
+                })
+                .unwrap_or_else(|| Rc::clone(&browser.root_folder))
+        } else {
+            Rc::clone(&browser.root_folder)
+        };
+        let (messages, current_message_content) = Self::get_messages(browser, &messages_folder);
 
         let mut folder_list_state = ListState::default();
         if !folders.is_empty() {
@@ -241,10 +278,11 @@ impl AppState {
             current_headers: MessageHeaders::default(),
             active_pane: ActivePane::Folders,
             preview_scroll: 0,
+            messages_folder,
         }
     }
 
-    fn get_folders(browser: &PstBrowser, folder: &UnicodeFolder) -> Vec<String> {
+    fn get_folders(browser: &PstBrowser, folder: &UnicodeFolder) -> Vec<(String, usize)> {
         folder
             .hierarchy_table()
             .map(|table| {
@@ -258,11 +296,40 @@ impl AppState {
                             .ok()?;
                         let subfolder =
                             UnicodeFolder::read(Rc::clone(&browser.store), &entry_id).ok()?;
-                        subfolder.properties().display_name().ok()
+                        let name = subfolder.properties().display_name().ok()?;
+                        let count = subfolder
+                            .contents_table()
+                            .map(|t| t.rows_matrix().count())
+                            .unwrap_or(0);
+                        Some((name, count))
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn preview_folder(&mut self, browser: &PstBrowser, index: usize) {
+        let current_folder = Rc::clone(&self.current_folder);
+        if let Some(table) = current_folder.hierarchy_table()
+            && let Some(row) = table.rows_matrix().nth(index)
+        {
+            let entry_id = browser
+                .store
+                .properties()
+                .make_entry_id(NodeId::from(u32::from(row.id())))
+                .ok();
+            if let Some(entry_id) = entry_id
+                && let Ok(folder) = UnicodeFolder::read(Rc::clone(&browser.store), &entry_id)
+            {
+                let (messages, content) = Self::get_messages(browser, &folder);
+                self.messages = messages;
+                self.current_message_content = content;
+                self.current_headers = MessageHeaders::default();
+                self.message_list_state = ListState::default();
+                self.preview_scroll = 0;
+                self.messages_folder = folder;
+            }
+        }
     }
 
     fn get_messages(browser: &PstBrowser, folder: &UnicodeFolder) -> (Vec<String>, String) {
@@ -326,9 +393,6 @@ impl AppState {
             {
                 self.current_folder = new_folder;
                 self.folders = Self::get_folders(browser, &self.current_folder);
-                let (messages, content) = Self::get_messages(browser, &self.current_folder);
-                self.messages = messages;
-                self.current_message_content = content;
                 self.current_headers = MessageHeaders::default();
                 let mut folder_state = ListState::default();
                 if !self.folders.is_empty() {
@@ -336,14 +400,23 @@ impl AppState {
                 }
                 self.folder_list_state = folder_state;
                 self.message_list_state = ListState::default();
+                self.preview_scroll = 0;
                 self.active_pane = ActivePane::Folders;
+                // Show first subfolder's messages if there are subfolders, else this folder's
+                if !self.folders.is_empty() {
+                    self.preview_folder(browser, 0);
+                } else {
+                    let (messages, content) = Self::get_messages(browser, &self.current_folder);
+                    self.messages = messages;
+                    self.current_message_content = content;
+                    self.messages_folder = Rc::clone(&self.current_folder);
+                }
             }
         }
     }
 
     fn select_message(&mut self, browser: &PstBrowser, index: usize) {
-        // Clone current folder reference to avoid borrow issues
-        let current_folder = Rc::clone(&self.current_folder);
+        let current_folder = Rc::clone(&self.messages_folder);
 
         if let Some(table) = current_folder.contents_table()
             && let Some(row) = table.rows_matrix().nth(index)
@@ -354,9 +427,20 @@ impl AppState {
                 .make_entry_id(NodeId::from(u32::from(row.id())))
                 .ok();
 
-            if let Some(entry_id) = entry_id
-                && let Ok(message) =
-                    UnicodeMessage::read(Rc::clone(&browser.store), &entry_id, None)
+            let message_result = entry_id.and_then(|eid| {
+                UnicodeMessage::read(
+                    Rc::clone(&browser.store),
+                    &eid,
+                    Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06, 0x1000, 0x1013, 0x1009]),
+                ).ok()
+            });
+            if message_result.is_none() {
+                self.current_message_content =
+                    "(This item type cannot be displayed — not a standard email message)".to_string();
+                self.current_headers = MessageHeaders::default();
+                self.preview_scroll = 0;
+            }
+            if let Some(message) = message_result
             {
                 let props = message.properties();
 
@@ -375,7 +459,7 @@ impl AppState {
                     .get(0x0039)
                     .or_else(|| props.get(0x0E06))
                     .and_then(|v| match v {
-                        PropertyValue::Time(t) => Some(t.to_string()),
+                        PropertyValue::Time(t) => Some(filetime_to_string(*t)),
                         _ => None,
                     })
                     .unwrap_or_default();
@@ -514,7 +598,7 @@ fn draw_folder_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect
     let items: Vec<ListItem> = state
         .folders
         .iter()
-        .map(|name| ListItem::new(name.as_str()))
+        .map(|(name, count)| ListItem::new(format!("{} ({})", name, count)))
         .collect();
 
     let border_style = if state.active_pane == ActivePane::Folders {
@@ -672,6 +756,7 @@ fn handle_events(
                         .unwrap_or(0);
                     if !state.folders.is_empty() {
                         state.folder_list_state.select(Some(next));
+                        state.preview_folder(browser, next);
                     }
                 }
                 ActivePane::Messages => {
@@ -695,6 +780,7 @@ fn handle_events(
                         && i > 0
                     {
                         state.folder_list_state.select(Some(i - 1));
+                        state.preview_folder(browser, i - 1);
                     }
                 }
                 ActivePane::Messages => {
@@ -726,19 +812,26 @@ fn handle_events(
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                let root_folder = Rc::clone(&browser.root_folder);
-                state.current_folder = Rc::clone(&root_folder);
+                state.current_folder = Rc::clone(&browser.root_folder);
                 state.folders = AppState::get_folders(browser, &state.current_folder);
-                let (messages, content) = AppState::get_messages(browser, &state.current_folder);
-                state.messages = messages;
-                state.current_message_content = content;
+                state.current_headers = MessageHeaders::default();
                 let mut folder_state = ListState::default();
                 if !state.folders.is_empty() {
                     folder_state.select(Some(0));
                 }
                 state.folder_list_state = folder_state;
                 state.message_list_state = ListState::default();
+                state.preview_scroll = 0;
                 state.active_pane = ActivePane::Folders;
+                if !state.folders.is_empty() {
+                    state.preview_folder(browser, 0);
+                } else {
+                    let (messages, content) =
+                        AppState::get_messages(browser, &state.current_folder);
+                    state.messages = messages;
+                    state.current_message_content = content;
+                    state.messages_folder = Rc::clone(&state.current_folder);
+                }
             }
             _ => {}
         }
@@ -762,5 +855,68 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    fn open_test_store(path: &str) -> (Rc<UnicodeStore>, Rc<UnicodeFolder>) {
+        let pst = Rc::new(UnicodePstFile::open(path).unwrap());
+        let store = UnicodeStore::read(Rc::clone(&pst)).unwrap();
+        let entry_id = store.properties().ipm_sub_tree_entry_id().unwrap();
+        let root = UnicodeFolder::read(Rc::clone(&store), &entry_id).unwrap();
+        (store, root)
+    }
+
+    fn prop_to_string(v: &PropertyValue) -> Option<String> {
+        match v {
+            PropertyValue::String8(s) => Some(s.to_string()),
+            PropertyValue::Unicode(s) => Some(s.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_message_content_loads() {
+        let (store, root) = open_test_store("testdata/outlook.pst");
+        fn check_folder(store: &Rc<UnicodeStore>, folder: &UnicodeFolder, depth: usize) {
+            let name = folder.properties().display_name().unwrap_or_default();
+            if let Some(table) = folder.contents_table() {
+                for row in table.rows_matrix() {
+                    let entry_id = store.properties()
+                        .make_entry_id(NodeId::from(u32::from(row.id()))).unwrap();
+                    let props_filter = Some(&[0x0037u16, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06, 0x1000, 0x1013, 0x1009][..]);
+                    match UnicodeMessage::read(Rc::clone(store), &entry_id, props_filter) {
+                        Ok(msg) => {
+                            let props = msg.properties();
+                            let subj = props.get(0x0037).and_then(prop_to_string).unwrap_or("(none)".into());
+                            let body_plain = props.get(0x1000).and_then(prop_to_string);
+                            let body_html = props.get(0x1013).and_then(|v| match v {
+                                PropertyValue::Binary(b) => String::from_utf8(b.buffer().to_vec()).ok(),
+                                _ => prop_to_string(v),
+                            });
+                            eprintln!("{}{}/{}  plain={} html={}",
+                                "  ".repeat(depth), name, subj,
+                                body_plain.as_deref().map(|s| &s[..s.len().min(60)]).unwrap_or("NONE"),
+                                body_html.as_deref().map(|s| &s[..s.len().min(60)]).unwrap_or("NONE"));
+                        }
+                        Err(e) => eprintln!("{}{}  ERROR: {}", "  ".repeat(depth), name, e),
+                    }
+                }
+            }
+            if let Some(htable) = folder.hierarchy_table() {
+                for row in htable.rows_matrix() {
+                    let entry_id = store.properties()
+                        .make_entry_id(NodeId::from(u32::from(row.id()))).unwrap();
+                    if let Ok(sub) = UnicodeFolder::read(Rc::clone(store), &entry_id) {
+                        check_folder(store, &sub, depth + 1);
+                    }
+                }
+            }
+        }
+        check_folder(&store, &root, 0);
     }
 }
