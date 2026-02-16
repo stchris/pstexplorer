@@ -96,6 +96,13 @@ fn html_to_text(html: &str) -> String {
                     }
                     _ => { out.push('&'); out.push_str(&entity); out.push(';'); }
                 }
+            } else if c == '\n' || c == '\r' || c == '\t' {
+                // Per HTML spec, whitespace in text nodes collapses to a single
+                // space. Only block-level tags (br, p, div…) produce newlines.
+                let last = out.chars().next_back();
+                if last.map_or(false, |ch| ch != ' ' && ch != '\n') {
+                    out.push(' ');
+                }
             } else {
                 out.push(c);
             }
@@ -321,6 +328,145 @@ fn search_traverse_folders(
     Ok(match_count)
 }
 
+fn run_search(browser: &PstBrowser, query: &str) -> Vec<SearchResultItem> {
+    let query_lower = query.to_ascii_lowercase();
+    let mut results = Vec::new();
+    collect_search_results(
+        Rc::clone(&browser.store),
+        &browser.root_folder,
+        &query_lower,
+        &mut results,
+    );
+    results
+}
+
+fn collect_search_results(
+    store: Rc<UnicodeStore>,
+    folder: &UnicodeFolder,
+    query_lower: &str,
+    results: &mut Vec<SearchResultItem>,
+) {
+    let folder_name = folder
+        .properties()
+        .display_name()
+        .unwrap_or_else(|_| "Unknown".to_string());
+
+    if let Some(contents_table) = folder.contents_table() {
+        for message_row in contents_table.rows_matrix() {
+            let row_id = u32::from(message_row.id());
+            let entry_id = match store
+                .properties()
+                .make_entry_id(NodeId::from(row_id))
+            {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            let message = match UnicodeMessage::read(
+                Rc::clone(&store),
+                &entry_id,
+                Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x1000, 0x1013, 0x1009]),
+            ) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let props = message.properties();
+            let get_str = |id: u16| -> String {
+                props
+                    .get(id)
+                    .and_then(|v| match v {
+                        PropertyValue::String8(s) => Some(s.to_string()),
+                        PropertyValue::Unicode(s) => Some(s.to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            };
+
+            let from = get_str(0x0C1A);
+            let to = get_str(0x0E04);
+            let cc = get_str(0x0E02);
+            let subject = get_str(0x0037);
+
+            let get_str_prop = |id: u16| -> Option<String> {
+                props.get(id).and_then(|v| match v {
+                    PropertyValue::String8(s) => Some(s.to_string()),
+                    PropertyValue::Unicode(s) => Some(s.to_string()),
+                    _ => None,
+                })
+            };
+            let body = if let Some(s) = get_str_prop(0x1000) {
+                s
+            } else if let Some(html) = get_str_prop(0x1013) {
+                html_to_text(&html)
+            } else if let Some(PropertyValue::Binary(rtf)) = props.get(0x1009) {
+                rtf_compressed_to_text(rtf.buffer()).unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let matches = [&from, &to, &cc, &body]
+                .iter()
+                .any(|s| s.to_ascii_lowercase().contains(query_lower));
+
+            if matches {
+                results.push(SearchResultItem {
+                    folder_name: folder_name.clone(),
+                    subject,
+                    row_id,
+                });
+            }
+        }
+    }
+
+    if let Some(hierarchy_table) = folder.hierarchy_table() {
+        for subfolder_row in hierarchy_table.rows_matrix() {
+            let Ok(entry_id) = store
+                .properties()
+                .make_entry_id(NodeId::from(u32::from(subfolder_row.id())))
+            else {
+                continue;
+            };
+            let Ok(subfolder) = UnicodeFolder::read(Rc::clone(&store), &entry_id) else {
+                continue;
+            };
+            collect_search_results(Rc::clone(&store), &subfolder, query_lower, results);
+        }
+    }
+}
+
+fn collect_all_messages(
+    store: Rc<UnicodeStore>,
+    folder: &UnicodeFolder,
+    results: &mut Vec<(String, u32)>,
+) {
+    let folder_name = folder
+        .properties()
+        .display_name()
+        .unwrap_or_else(|_| "Unknown".to_string());
+
+    if let Some(contents_table) = folder.contents_table() {
+        for row in contents_table.rows_matrix() {
+            results.push((folder_name.clone(), u32::from(row.id())));
+        }
+    }
+
+    if let Some(hierarchy_table) = folder.hierarchy_table() {
+        for row in hierarchy_table.rows_matrix() {
+            let Ok(entry_id) = store
+                .properties()
+                .make_entry_id(NodeId::from(u32::from(row.id())))
+            else {
+                continue;
+            };
+            let Ok(subfolder) = UnicodeFolder::read(Rc::clone(&store), &entry_id) else {
+                continue;
+            };
+            collect_all_messages(Rc::clone(&store), &subfolder, results);
+        }
+    }
+}
+
 fn traverse_folder_hierarchy(
     store: Rc<UnicodeStore>,
     folder: &outlook_pst::messaging::folder::UnicodeFolder,
@@ -431,6 +577,12 @@ struct PstBrowser {
     root_folder: Rc<UnicodeFolder>,
 }
 
+struct SearchResultItem {
+    folder_name: String,
+    subject: String,
+    row_id: u32,
+}
+
 #[derive(Default)]
 struct MessageHeaders {
     from: String,
@@ -442,34 +594,39 @@ struct MessageHeaders {
 
 #[derive(PartialEq)]
 enum ActivePane {
-    Folders,
     Messages,
     Preview,
 }
 
 struct AppState {
     exit: bool,
-    current_folder: Rc<UnicodeFolder>,
-    folder_list_state: ListState,
-    message_list_state: ListState,
-    folders: Vec<(String, usize, bool)>,
-    /// Node IDs for every message in the current folder (collected cheaply upfront).
+    /// All message row IDs across every folder, collected at startup.
+    all_row_ids: Vec<u32>,
+    /// Folder name for each entry in all_row_ids.
+    all_folder_names: Vec<String>,
+    /// Row IDs for the current view (all messages, or search results).
     message_row_ids: Vec<u32>,
+    /// Folder name for each entry in message_row_ids.
+    message_folder_names: Vec<String>,
     /// Lazily loaded subjects; None = not yet fetched.
     message_subjects: Vec<Option<String>>,
+    message_list_state: ListState,
     /// Height of the message list area as of the last draw — used to size the load window.
     message_list_height: usize,
     current_message_content: String,
     current_headers: MessageHeaders,
     active_pane: ActivePane,
     preview_scroll: u16,
-    /// The folder whose messages are currently shown in the message list.
-    /// Differs from current_folder when hovering over a subfolder.
-    messages_folder: Rc<UnicodeFolder>,
     /// Debug event log; None if debug mode not enabled.
     debug_log: Option<Vec<String>>,
     /// Transient status bar message (cleared on next keypress).
     status_message: Option<String>,
+    /// Current text in the search bar.
+    search_input: String,
+    /// Whether keyboard input is being captured by the search bar.
+    search_bar_active: bool,
+    /// Whether we are currently showing search results instead of all messages.
+    search_mode: bool,
 }
 
 impl PstBrowser {
@@ -480,78 +637,51 @@ impl PstBrowser {
 
 impl AppState {
     fn new(browser: &PstBrowser, debug: bool) -> Self {
-        let folders = Self::get_folders(browser, &browser.root_folder);
+        let mut all_messages: Vec<(String, u32)> = Vec::new();
+        collect_all_messages(
+            Rc::clone(&browser.store),
+            &browser.root_folder,
+            &mut all_messages,
+        );
+        let all_row_ids: Vec<u32> = all_messages.iter().map(|(_, id)| *id).collect();
+        let all_folder_names: Vec<String> = all_messages.iter().map(|(n, _)| n.clone()).collect();
+        let n = all_row_ids.len();
 
-        // Show messages from the first subfolder (if any), otherwise root folder.
-        // Also keep track of which folder is being shown so select_message is correct.
-        let messages_folder: Rc<UnicodeFolder> = if !folders.is_empty() {
-            browser
-                .root_folder
-                .hierarchy_table()
-                .and_then(|t| t.rows_matrix().next())
-                .and_then(|row| {
-                    let entry_id = browser
-                        .store
-                        .properties()
-                        .make_entry_id(NodeId::from(u32::from(row.id())))
-                        .ok()?;
-                    UnicodeFolder::read(Rc::clone(&browser.store), &entry_id).ok()
-                })
-                .unwrap_or_else(|| Rc::clone(&browser.root_folder))
-        } else {
-            Rc::clone(&browser.root_folder)
-        };
-        let message_row_ids = Self::collect_row_ids(&messages_folder);
-        let subjects_len = message_row_ids.len();
-        let current_message_content = if subjects_len == 0 {
-            "No messages in this folder".to_string()
-        } else {
-            "Select a message to view its content".to_string()
-        };
-
-        let mut folder_list_state = ListState::default();
-        if !folders.is_empty() {
-            folder_list_state.select(Some(0));
+        let mut message_list_state = ListState::default();
+        if n > 0 {
+            message_list_state.select(Some(0));
         }
 
         Self {
             exit: false,
-            current_folder: Rc::clone(&browser.root_folder),
-            folder_list_state,
-            message_list_state: ListState::default(),
-            folders,
-            message_row_ids,
-            message_subjects: vec![None; subjects_len],
+            message_row_ids: all_row_ids.clone(),
+            message_folder_names: all_folder_names.clone(),
+            all_row_ids,
+            all_folder_names,
+            message_subjects: vec![None; n],
+            message_list_state,
             message_list_height: 20,
-            current_message_content,
+            current_message_content: if n == 0 {
+                "No messages found".to_string()
+            } else {
+                "Select a message to view its content".to_string()
+            },
             current_headers: MessageHeaders::default(),
-            active_pane: ActivePane::Folders,
+            active_pane: ActivePane::Messages,
             preview_scroll: 0,
-            messages_folder,
             debug_log: if debug { Some(vec![]) } else { None },
             status_message: None,
+            search_input: String::new(),
+            search_bar_active: false,
+            search_mode: false,
         }
-    }
-
-    /// Collect node IDs for all rows in a folder's contents table — does NOT open messages.
-    fn collect_row_ids(folder: &UnicodeFolder) -> Vec<u32> {
-        folder
-            .contents_table()
-            .map(|table| {
-                table
-                    .rows_matrix()
-                    .map(|row| u32::from(row.id()))
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     /// Load subjects for the visible window around the current scroll offset.
     fn load_visible_subjects(&mut self, browser: &PstBrowser) {
         let offset = self.message_list_state.offset();
-        let start = offset;
         let end = (offset + self.message_list_height + 5).min(self.message_row_ids.len());
-        for i in start..end {
+        for i in offset..end {
             if self.message_subjects[i].is_none() {
                 let subject = browser
                     .store
@@ -559,12 +689,7 @@ impl AppState {
                     .make_entry_id(NodeId::from(self.message_row_ids[i]))
                     .ok()
                     .and_then(|eid| {
-                        UnicodeMessage::read(
-                            Rc::clone(&browser.store),
-                            &eid,
-                            Some(&[0x0037]),
-                        )
-                        .ok()
+                        UnicodeMessage::read(Rc::clone(&browser.store), &eid, Some(&[0x0037])).ok()
                     })
                     .and_then(|msg| {
                         msg.properties().get(0x0037).and_then(|v| match v {
@@ -585,110 +710,18 @@ impl AppState {
         }
     }
 
-    fn get_folders(browser: &PstBrowser, folder: &UnicodeFolder) -> Vec<(String, usize, bool)> {
-        folder
-            .hierarchy_table()
-            .map(|table| {
-                table
-                    .rows_matrix()
-                    .filter_map(|row| {
-                        let entry_id = browser
-                            .store
-                            .properties()
-                            .make_entry_id(NodeId::from(u32::from(row.id())))
-                            .ok()?;
-                        let subfolder =
-                            UnicodeFolder::read(Rc::clone(&browser.store), &entry_id).ok()?;
-                        let name = subfolder.properties().display_name().ok()?;
-                        let count = subfolder
-                            .contents_table()
-                            .map(|t| t.rows_matrix().count())
-                            .unwrap_or(0);
-                        let has_subfolders = subfolder
-                            .hierarchy_table()
-                            .map(|t| t.rows_matrix().next().is_some())
-                            .unwrap_or(false);
-                        Some((name, count, has_subfolders))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn preview_folder(&mut self, browser: &PstBrowser, index: usize) {
-        let current_folder = Rc::clone(&self.current_folder);
-        if let Some(table) = current_folder.hierarchy_table()
-            && let Some(row) = table.rows_matrix().nth(index)
-        {
-            let entry_id = browser
-                .store
-                .properties()
-                .make_entry_id(NodeId::from(u32::from(row.id())))
-                .ok();
-            if let Some(entry_id) = entry_id
-                && let Ok(folder) = UnicodeFolder::read(Rc::clone(&browser.store), &entry_id)
-            {
-                self.set_messages_folder(folder);
-                self.message_list_state = ListState::default();
-                self.preview_scroll = 0;
-                self.current_headers = MessageHeaders::default();
-                self.current_message_content = if self.message_row_ids.is_empty() {
-                    "No messages in this folder".to_string()
-                } else {
-                    "Select a message to view its content".to_string()
-                };
-            }
-        }
-    }
-
-    fn set_messages_folder(&mut self, folder: Rc<UnicodeFolder>) {
-        let ids = Self::collect_row_ids(&folder);
-        let len = ids.len();
-        self.message_row_ids = ids;
-        self.message_subjects = vec![None; len];
-        self.messages_folder = folder;
-    }
-
-    fn navigate_to_folder(&mut self, browser: &PstBrowser, index: usize) {
-        // Clone current folder reference to avoid borrow issues
-        let current_folder = Rc::clone(&self.current_folder);
-
-        if let Some(table) = current_folder.hierarchy_table()
-            && let Some(row) = table.rows_matrix().nth(index)
-        {
-            let entry_id = browser
-                .store
-                .properties()
-                .make_entry_id(NodeId::from(u32::from(row.id())))
-                .ok();
-
-            if let Some(entry_id) = entry_id
-                && let Ok(new_folder) = UnicodeFolder::read(Rc::clone(&browser.store), &entry_id)
-            {
-                self.current_folder = new_folder;
-                self.folders = Self::get_folders(browser, &self.current_folder);
-                self.current_headers = MessageHeaders::default();
-                let mut folder_state = ListState::default();
-                if !self.folders.is_empty() {
-                    folder_state.select(Some(0));
-                }
-                self.folder_list_state = folder_state;
-                self.message_list_state = ListState::default();
-                self.preview_scroll = 0;
-                self.active_pane = ActivePane::Folders;
-                // Show first subfolder's messages if there are subfolders, else this folder's
-                if !self.folders.is_empty() {
-                    self.preview_folder(browser, 0);
-                } else {
-                    self.set_messages_folder(Rc::clone(&self.current_folder));
-                    self.current_message_content = if self.message_row_ids.is_empty() {
-                        "No messages in this folder".to_string()
-                    } else {
-                        "Select a message to view its content".to_string()
-                    };
-                }
-            }
-        }
+    fn restore_all_messages(&mut self) {
+        let n = self.all_row_ids.len();
+        self.message_row_ids = self.all_row_ids.clone();
+        self.message_folder_names = self.all_folder_names.clone();
+        self.message_subjects = vec![None; n];
+        self.search_mode = false;
+        self.search_input.clear();
+        self.message_list_state = ListState::default();
+        if n > 0 { self.message_list_state.select(Some(0)); }
+        self.current_headers = MessageHeaders::default();
+        self.current_message_content = "Select a message to view its content".to_string();
+        self.preview_scroll = 0;
     }
 
     fn select_message(&mut self, browser: &PstBrowser, index: usize) {
@@ -852,29 +885,33 @@ fn draw_ui(frame: &mut ratatui::Frame, _browser: &PstBrowser, state: &mut AppSta
     let layout = Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
+            Constraint::Length(1), // Search bar
             Constraint::Min(0),    // Main content
             Constraint::Length(1), // Status bar
         ])
         .split(frame.area());
 
-    let main_layout = Layout::default()
-        .direction(ratatui::layout::Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(30), // Folder list
-            Constraint::Percentage(70), // Messages + preview
-        ])
-        .split(layout[0]);
+    draw_search_bar(frame, state, layout[0]);
 
-    draw_folder_list(frame, state, main_layout[0]);
-    draw_messages_pane(frame, state, main_layout[1]);
+    let main_layout = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(35), // Message list
+            Constraint::Percentage(65), // Message preview
+        ])
+        .split(layout[1]);
+
+    draw_message_list(frame, state, main_layout[0]);
+    draw_message_preview(frame, state, main_layout[1]);
 
     let status_text = if let Some(msg) = &state.status_message {
         msg.clone()
+    } else if state.search_bar_active {
+        " [Search] type to search  Enter: run  Esc: cancel".to_string()
     } else {
         match state.active_pane {
-            ActivePane::Folders => " [Folders] j/k: navigate  Enter/l: open  h: back  Tab: → messages  D: dump state  q: quit".to_string(),
-            ActivePane::Messages => " [Messages] j/k: navigate  Enter: view  Tab: → preview  D: dump state  q: quit".to_string(),
-            ActivePane::Preview => " [Preview] j/k: scroll  Tab: → folders  D: dump state  q: quit".to_string(),
+            ActivePane::Messages => " [Messages] j/k: navigate  Enter/Tab: preview  /: search  Esc: clear search  q: quit".to_string(),
+            ActivePane::Preview => " [Preview] j/k: scroll  Tab: → messages  /: search  Esc: clear search  q: quit".to_string(),
         }
     };
     let status_style = if state.status_message.is_some() {
@@ -883,64 +920,50 @@ fn draw_ui(frame: &mut ratatui::Frame, _browser: &PstBrowser, state: &mut AppSta
         Style::default().fg(ratatui::style::Color::DarkGray)
     };
     let status = ratatui::widgets::Paragraph::new(status_text).style(status_style);
-    frame.render_widget(status, layout[1]);
+    frame.render_widget(status, layout[2]);
 }
 
-fn draw_folder_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
-    let folder_name = state
-        .current_folder
-        .properties()
-        .display_name()
-        .unwrap_or_else(|_| "Root".to_string());
-
-    let items: Vec<ListItem> = state
-        .folders
-        .iter()
-        .map(|(name, count, has_sub)| {
-            let label = if *has_sub && *count == 0 {
-                format!("▶ {}", name)
-            } else if *has_sub {
-                format!("▶ {} ({})", name, count)
-            } else {
-                format!("{} ({})", name, count)
-            };
-            ListItem::new(label)
-        })
-        .collect();
-
-    let border_style = if state.active_pane == ActivePane::Folders {
-        Style::default().fg(ratatui::style::Color::Cyan)
+fn draw_search_bar(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let (label_style, input_style, cursor_style) = if state.search_bar_active {
+        (
+            Style::default().fg(ratatui::style::Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(ratatui::style::Color::White),
+            Style::default().fg(ratatui::style::Color::Cyan).add_modifier(Modifier::BOLD),
+        )
+    } else if state.search_mode {
+        (
+            Style::default().fg(ratatui::style::Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(ratatui::style::Color::White),
+            Style::default(),
+        )
     } else {
-        Style::default()
+        (
+            Style::default().fg(ratatui::style::Color::DarkGray),
+            Style::default().fg(ratatui::style::Color::DarkGray),
+            Style::default(),
+        )
     };
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(format!("Folders - {}", folder_name)),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(ratatui::style::Color::Yellow)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        );
+    let mut spans = vec![
+        Span::styled(" Search: ", label_style),
+        Span::styled(state.search_input.clone(), input_style),
+    ];
+    if state.search_bar_active {
+        spans.push(Span::styled("▋", cursor_style));
+    } else if state.search_mode {
+        let count = state.message_row_ids.len();
+        spans.push(Span::styled(
+            format!("  ({} result{})", count, if count == 1 { "" } else { "s" }),
+            Style::default().fg(ratatui::style::Color::Yellow),
+        ));
+    } else if state.search_input.is_empty() {
+        spans.push(Span::styled("Press / to search", Style::default().fg(ratatui::style::Color::DarkGray)));
+    }
 
-    frame.render_stateful_widget(list, area, &mut state.folder_list_state);
-}
-
-fn draw_messages_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
-    let layout = Layout::default()
-        .direction(ratatui::layout::Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(40), // Message list
-            Constraint::Percentage(60), // Message preview
-        ])
-        .split(area);
-
-    draw_message_list(frame, state, layout[0]);
-    draw_message_preview(frame, state, layout[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        area,
+    );
 }
 
 fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
@@ -949,14 +972,18 @@ fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     state.message_list_height = area.height.saturating_sub(2) as usize;
 
     let count = state.message_row_ids.len();
-    let title = format!("Messages ({}/{})", state.message_list_state.selected().map(|i| i + 1).unwrap_or(0), count);
+    let selected_num = state.message_list_state.selected().map(|i| i + 1).unwrap_or(0);
+    let title = if state.search_mode {
+        format!("Search Results ({}/{})", selected_num, count)
+    } else {
+        format!("Messages ({}/{})", selected_num, count)
+    };
 
     let items: Vec<ListItem> = (0..count)
         .map(|i| {
-            let text = state.message_subjects[i]
-                .as_deref()
-                .unwrap_or("…");
-            ListItem::new(text.to_string())
+            let folder = state.message_folder_names.get(i).map(|s| s.as_str()).unwrap_or("?");
+            let subject = state.message_subjects[i].as_deref().unwrap_or("…");
+            ListItem::new(format!("{} | {}", folder, subject))
         })
         .collect();
 
@@ -1044,17 +1071,12 @@ fn handle_events(
         && let Event::Key(key) = event::read()?
         && key.kind == KeyEventKind::Press
     {
-        // Clear transient status message on any keypress
         state.status_message = None;
 
-        // Log keypress if debug mode enabled
         let pane_name = match state.active_pane {
-            ActivePane::Folders => "Folders",
             ActivePane::Messages => "Messages",
             ActivePane::Preview => "Preview",
         };
-        let folder_idx = state.folder_list_state.selected().unwrap_or(0);
-        let msg_idx = state.message_list_state.selected().unwrap_or(0);
         let key_str = match key.code {
             KeyCode::Char(c) => format!("'{}'", c),
             KeyCode::Enter => "Enter".to_string(),
@@ -1062,47 +1084,71 @@ fn handle_events(
             KeyCode::Esc => "Esc".to_string(),
             KeyCode::Up => "Up".to_string(),
             KeyCode::Down => "Down".to_string(),
-            KeyCode::Left => "Left".to_string(),
-            KeyCode::Right => "Right".to_string(),
             _ => format!("{:?}", key.code),
         };
         state.log_event(&format!(
-            "[KEY] {} | pane={} folder_idx={} msg_idx={} scroll={}",
-            key_str, pane_name, folder_idx, msg_idx, state.preview_scroll
+            "[KEY] {} | pane={} msg_idx={:?} scroll={}",
+            key_str, pane_name, state.message_list_state.selected(), state.preview_scroll
         ));
 
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => state.exit = true,
-            KeyCode::Tab => {
-                match state.active_pane {
-                    ActivePane::Folders => {
-                        state.active_pane = ActivePane::Messages;
-                        if state.message_list_state.selected().is_none()
-                            && !state.message_row_ids.is_empty()
-                        {
+        // --- Search bar input mode ---
+        if state.search_bar_active {
+            match key.code {
+                KeyCode::Esc => {
+                    state.search_bar_active = false;
+                    if state.search_input.is_empty() {
+                        state.search_mode = false;
+                    }
+                }
+                KeyCode::Enter => {
+                    state.search_bar_active = false;
+                    if !state.search_input.is_empty() {
+                        let results = run_search(browser, &state.search_input);
+                        let n = results.len();
+                        state.search_mode = true;
+                        state.message_row_ids = results.iter().map(|r| r.row_id).collect();
+                        state.message_folder_names = results.iter().map(|r| r.folder_name.clone()).collect();
+                        state.message_subjects = results.iter().map(|r| Some(r.subject.clone())).collect();
+                        state.message_list_state = ListState::default();
+                        if n > 0 {
                             state.message_list_state.select(Some(0));
+                            state.select_message(browser, 0);
+                        } else {
+                            state.current_headers = MessageHeaders::default();
+                            state.current_message_content = "No messages match the search query".to_string();
                         }
+                        state.preview_scroll = 0;
+                        state.active_pane = ActivePane::Messages;
+                    } else {
+                        state.restore_all_messages();
                     }
-                    ActivePane::Messages => {
-                        state.active_pane = ActivePane::Preview;
-                    }
-                    ActivePane::Preview => {
-                        state.active_pane = ActivePane::Folders;
-                    }
+                }
+                KeyCode::Backspace => { state.search_input.pop(); }
+                KeyCode::Char(c) => { state.search_input.push(c); }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Char('q') => state.exit = true,
+            KeyCode::Esc => {
+                if state.search_mode {
+                    state.restore_all_messages();
+                } else {
+                    state.exit = true;
                 }
             }
+            KeyCode::Char('/') => {
+                state.search_bar_active = true;
+            }
+            KeyCode::Tab => {
+                state.active_pane = match state.active_pane {
+                    ActivePane::Messages => ActivePane::Preview,
+                    ActivePane::Preview => ActivePane::Messages,
+                };
+            }
             KeyCode::Char('j') | KeyCode::Down => match state.active_pane {
-                ActivePane::Folders => {
-                    let next = state
-                        .folder_list_state
-                        .selected()
-                        .map(|i| (i + 1).min(state.folders.len().saturating_sub(1)))
-                        .unwrap_or(0);
-                    if !state.folders.is_empty() {
-                        state.folder_list_state.select(Some(next));
-                        state.preview_folder(browser, next);
-                    }
-                }
                 ActivePane::Messages => {
                     let next = state
                         .message_list_state
@@ -1119,14 +1165,6 @@ fn handle_events(
                 }
             },
             KeyCode::Char('k') | KeyCode::Up => match state.active_pane {
-                ActivePane::Folders => {
-                    if let Some(i) = state.folder_list_state.selected()
-                        && i > 0
-                    {
-                        state.folder_list_state.select(Some(i - 1));
-                        state.preview_folder(browser, i - 1);
-                    }
-                }
                 ActivePane::Messages => {
                     if let Some(i) = state.message_list_state.selected()
                         && i > 0
@@ -1139,96 +1177,10 @@ fn handle_events(
                     state.preview_scroll = state.preview_scroll.saturating_sub(1);
                 }
             },
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
-                match state.active_pane {
-                    ActivePane::Folders => {
-                        if let Some(selected) = state.folder_list_state.selected() {
-                            state.navigate_to_folder(browser, selected);
-                        }
-                    }
-                    ActivePane::Messages => {
-                        if let Some(selected) = state.message_list_state.selected() {
-                            state.select_message(browser, selected);
-                            state.active_pane = ActivePane::Preview;
-                        }
-                    }
-                    ActivePane::Preview => {}
-                }
-            }
-            KeyCode::Char('D') => {
-                let folder_name = state
-                    .current_folder
-                    .properties()
-                    .display_name()
-                    .unwrap_or_else(|_| "?".to_string());
-                let messages_folder_name = state
-                    .messages_folder
-                    .properties()
-                    .display_name()
-                    .unwrap_or_else(|_| "?".to_string());
-                let raw_row_count = state
-                    .messages_folder
-                    .contents_table()
-                    .map(|t| t.rows_matrix().count())
-                    .unwrap_or(0);
-                let pane = match state.active_pane {
-                    ActivePane::Folders => "Folders",
-                    ActivePane::Messages => "Messages",
-                    ActivePane::Preview => "Preview",
-                };
-                let dump = format!(
-                    "=== pstexplorer state dump ===\n\
-                     active_pane:       {}\n\
-                     current_folder:    {} ({} subfolders)\n\
-                     messages_folder:   {} (raw rows={} displayed={})\n\
-                     folder_idx:        {:?}\n\
-                     message_idx:       {:?}\n\
-                     preview_scroll:    {}\n\
-                     debug_mode:        {}\n",
-                    pane,
-                    folder_name,
-                    state.folders.len(),
-                    messages_folder_name,
-                    raw_row_count,
-                    state.message_row_ids.len(),
-                    state.folder_list_state.selected(),
-                    state.message_list_state.selected(),
-                    state.preview_scroll,
-                    state.debug_log.is_some(),
-                );
-                let dump_path = "pstexplorer-state-dump.txt";
-                match std::fs::write(dump_path, &dump) {
-                    Ok(_) => {
-                        state.log_event(&format!("[DUMP] State dumped to {}", dump_path));
-                        state.status_message = Some(format!(" State dumped to {}", dump_path));
-                    }
-                    Err(e) => {
-                        state.status_message = Some(format!(" Dump failed: {}", e));
-                    }
-                }
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                state.current_folder = Rc::clone(&browser.root_folder);
-                state.folders = AppState::get_folders(browser, &state.current_folder);
-                state.current_headers = MessageHeaders::default();
-                let mut folder_state = ListState::default();
-                if !state.folders.is_empty() {
-                    folder_state.select(Some(0));
-                }
-                state.folder_list_state = folder_state;
-                state.message_list_state = ListState::default();
-                state.preview_scroll = 0;
-                state.active_pane = ActivePane::Folders;
-                if !state.folders.is_empty() {
-                    state.preview_folder(browser, 0);
-                } else {
-                    let folder = Rc::clone(&state.current_folder);
-                    state.set_messages_folder(folder);
-                    state.current_message_content = if state.message_row_ids.is_empty() {
-                        "No messages in this folder".to_string()
-                    } else {
-                        "Select a message to view its content".to_string()
-                    };
+            KeyCode::Enter => {
+                if let Some(selected) = state.message_list_state.selected() {
+                    state.select_message(browser, selected);
+                    state.active_pane = ActivePane::Preview;
                 }
             }
             _ => {}
