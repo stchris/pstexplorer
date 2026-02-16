@@ -23,6 +23,104 @@ use std::{io, path::PathBuf, rc::Rc};
 
 /// Convert a Windows FILETIME (100-ns ticks since 1601-01-01 UTC) to a
 /// human-readable UTC string, e.g. "2010-11-24 15:24:27 UTC".
+/// Decompress PR_RTF_COMPRESSED bytes and extract plain text.
+fn rtf_compressed_to_text(data: &[u8]) -> Option<String> {
+    let rtf = compressed_rtf::decompress_rtf(data).ok()?;
+    let doc = rtf_parser::RtfDocument::try_from(rtf.as_str()).ok()?;
+    Some(doc.get_text())
+}
+
+/// Strip HTML tags and decode common HTML entities for plain-text display.
+fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut in_style = false;
+    let mut in_script = false;
+    let mut tag_buf = String::new();
+
+    let mut chars = html.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_tag {
+            if c == '>' {
+                let tag_lower = tag_buf.trim().to_ascii_lowercase();
+                if tag_lower.starts_with("style") {
+                    in_style = true;
+                } else if tag_lower.starts_with("/style") {
+                    in_style = false;
+                } else if tag_lower.starts_with("script") {
+                    in_script = true;
+                } else if tag_lower.starts_with("/script") {
+                    in_script = false;
+                } else if !in_style && !in_script {
+                    // Block-level tags → newline
+                    let t = tag_lower.split_whitespace().next().unwrap_or("");
+                    if matches!(t, "br" | "br/" | "p" | "/p" | "div" | "/div"
+                        | "tr" | "/tr" | "li" | "/li" | "h1" | "h2" | "h3"
+                        | "h4" | "h5" | "h6" | "/h1" | "/h2" | "/h3"
+                        | "/h4" | "/h5" | "/h6") {
+                        out.push('\n');
+                    }
+                }
+                tag_buf.clear();
+                in_tag = false;
+            } else {
+                tag_buf.push(c);
+            }
+        } else if c == '<' {
+            in_tag = true;
+            tag_buf.clear();
+        } else if !in_style && !in_script {
+            if c == '&' {
+                // Collect entity
+                let mut entity = String::new();
+                for ec in chars.by_ref() {
+                    if ec == ';' { break; }
+                    entity.push(ec);
+                }
+                match entity.as_str() {
+                    "amp"  => out.push('&'),
+                    "lt"   => out.push('<'),
+                    "gt"   => out.push('>'),
+                    "quot" => out.push('"'),
+                    "apos" => out.push('\''),
+                    "nbsp" => out.push(' '),
+                    s if s.starts_with('#') => {
+                        let n: Option<u32> = if s.starts_with("#x") || s.starts_with("#X") {
+                            u32::from_str_radix(&s[2..], 16).ok()
+                        } else {
+                            s[1..].parse().ok()
+                        };
+                        if let Some(n) = n.and_then(char::from_u32) {
+                            out.push(n);
+                        }
+                    }
+                    _ => { out.push('&'); out.push_str(&entity); out.push(';'); }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+    }
+
+    // Collapse runs of blank lines to at most one blank line
+    let mut result = String::with_capacity(out.len());
+    let mut blank_lines = 0u32;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            blank_lines += 1;
+            if blank_lines <= 1 {
+                result.push('\n');
+            }
+        } else {
+            blank_lines = 0;
+            result.push_str(trimmed);
+            result.push('\n');
+        }
+    }
+    result
+}
+
 fn filetime_to_string(ticks: i64) -> String {
     // Seconds between 1601-01-01 and 1970-01-01
     const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
@@ -224,7 +322,12 @@ struct AppState {
     folder_list_state: ListState,
     message_list_state: ListState,
     folders: Vec<(String, usize, bool)>,
-    messages: Vec<String>,
+    /// Node IDs for every message in the current folder (collected cheaply upfront).
+    message_row_ids: Vec<u32>,
+    /// Lazily loaded subjects; None = not yet fetched.
+    message_subjects: Vec<Option<String>>,
+    /// Height of the message list area as of the last draw — used to size the load window.
+    message_list_height: usize,
     current_message_content: String,
     current_headers: MessageHeaders,
     active_pane: ActivePane,
@@ -267,7 +370,13 @@ impl AppState {
         } else {
             Rc::clone(&browser.root_folder)
         };
-        let (messages, current_message_content) = Self::get_messages(browser, &messages_folder);
+        let message_row_ids = Self::collect_row_ids(&messages_folder);
+        let subjects_len = message_row_ids.len();
+        let current_message_content = if subjects_len == 0 {
+            "No messages in this folder".to_string()
+        } else {
+            "Select a message to view its content".to_string()
+        };
 
         let mut folder_list_state = ListState::default();
         if !folders.is_empty() {
@@ -280,7 +389,9 @@ impl AppState {
             folder_list_state,
             message_list_state: ListState::default(),
             folders,
-            messages,
+            message_row_ids,
+            message_subjects: vec![None; subjects_len],
+            message_list_height: 20,
             current_message_content,
             current_headers: MessageHeaders::default(),
             active_pane: ActivePane::Folders,
@@ -288,6 +399,52 @@ impl AppState {
             messages_folder,
             debug_log: if debug { Some(vec![]) } else { None },
             status_message: None,
+        }
+    }
+
+    /// Collect node IDs for all rows in a folder's contents table — does NOT open messages.
+    fn collect_row_ids(folder: &UnicodeFolder) -> Vec<u32> {
+        folder
+            .contents_table()
+            .map(|table| {
+                table
+                    .rows_matrix()
+                    .map(|row| u32::from(row.id()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Load subjects for the visible window around the current scroll offset.
+    fn load_visible_subjects(&mut self, browser: &PstBrowser) {
+        let offset = self.message_list_state.offset();
+        let start = offset;
+        let end = (offset + self.message_list_height + 5).min(self.message_row_ids.len());
+        for i in start..end {
+            if self.message_subjects[i].is_none() {
+                let subject = browser
+                    .store
+                    .properties()
+                    .make_entry_id(NodeId::from(self.message_row_ids[i]))
+                    .ok()
+                    .and_then(|eid| {
+                        UnicodeMessage::read(
+                            Rc::clone(&browser.store),
+                            &eid,
+                            Some(&[0x0037]),
+                        )
+                        .ok()
+                    })
+                    .and_then(|msg| {
+                        msg.properties().get(0x0037).and_then(|v| match v {
+                            PropertyValue::String8(s) => Some(s.to_string()),
+                            PropertyValue::Unicode(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or_else(|| "(no subject)".to_string());
+                self.message_subjects[i] = Some(subject);
+            }
         }
     }
 
@@ -340,60 +497,25 @@ impl AppState {
             if let Some(entry_id) = entry_id
                 && let Ok(folder) = UnicodeFolder::read(Rc::clone(&browser.store), &entry_id)
             {
-                let (messages, content) = Self::get_messages(browser, &folder);
-                self.messages = messages;
-                self.current_message_content = content;
-                self.current_headers = MessageHeaders::default();
+                self.set_messages_folder(folder);
                 self.message_list_state = ListState::default();
                 self.preview_scroll = 0;
-                self.messages_folder = folder;
+                self.current_headers = MessageHeaders::default();
+                self.current_message_content = if self.message_row_ids.is_empty() {
+                    "No messages in this folder".to_string()
+                } else {
+                    "Select a message to view its content".to_string()
+                };
             }
         }
     }
 
-    fn get_messages(browser: &PstBrowser, folder: &UnicodeFolder) -> (Vec<String>, String) {
-        let messages: Vec<String> = folder
-            .contents_table()
-            .map(|table| {
-                table
-                    .rows_matrix()
-                    .map(|row| {
-                        let entry_id = match browser
-                            .store
-                            .properties()
-                            .make_entry_id(NodeId::from(u32::from(row.id())))
-                        {
-                            Ok(eid) => eid,
-                            Err(e) => return format!("(entry id error: {})", e),
-                        };
-                        match UnicodeMessage::read(
-                            Rc::clone(&browser.store),
-                            &entry_id,
-                            Some(&[0x0037]),
-                        ) {
-                            Ok(message) => message
-                                .properties()
-                                .get(0x0037)
-                                .and_then(|v| match v {
-                                    PropertyValue::String8(s) => Some(s.to_string()),
-                                    PropertyValue::Unicode(s) => Some(s.to_string()),
-                                    _ => None,
-                                })
-                                .unwrap_or_else(|| "(no subject)".to_string()),
-                            Err(e) => format!("(unreadable: {})", e),
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let content = if messages.is_empty() {
-            "No messages in this folder".to_string()
-        } else {
-            "Select a message to view its content".to_string()
-        };
-
-        (messages, content)
+    fn set_messages_folder(&mut self, folder: Rc<UnicodeFolder>) {
+        let ids = Self::collect_row_ids(&folder);
+        let len = ids.len();
+        self.message_row_ids = ids;
+        self.message_subjects = vec![None; len];
+        self.messages_folder = folder;
     }
 
     fn navigate_to_folder(&mut self, browser: &PstBrowser, index: usize) {
@@ -427,25 +549,23 @@ impl AppState {
                 if !self.folders.is_empty() {
                     self.preview_folder(browser, 0);
                 } else {
-                    let (messages, content) = Self::get_messages(browser, &self.current_folder);
-                    self.messages = messages;
-                    self.current_message_content = content;
-                    self.messages_folder = Rc::clone(&self.current_folder);
+                    self.set_messages_folder(Rc::clone(&self.current_folder));
+                    self.current_message_content = if self.message_row_ids.is_empty() {
+                        "No messages in this folder".to_string()
+                    } else {
+                        "Select a message to view its content".to_string()
+                    };
                 }
             }
         }
     }
 
     fn select_message(&mut self, browser: &PstBrowser, index: usize) {
-        let current_folder = Rc::clone(&self.messages_folder);
-
-        if let Some(table) = current_folder.contents_table()
-            && let Some(row) = table.rows_matrix().nth(index)
-        {
+        if let Some(&row_id) = self.message_row_ids.get(index) {
             let entry_id = browser
                 .store
                 .properties()
-                .make_entry_id(NodeId::from(u32::from(row.id())))
+                .make_entry_id(NodeId::from(row_id))
                 .ok();
 
             let message_result = entry_id.and_then(|eid| {
@@ -502,15 +622,24 @@ impl AppState {
                     })
                     .or_else(|| {
                         props.get(0x1013).and_then(|value| match value {
-                            PropertyValue::Binary(b) => String::from_utf8(b.buffer().to_vec()).ok(),
-                            PropertyValue::String8(s) => Some(s.to_string()),
-                            PropertyValue::Unicode(s) => Some(s.to_string()),
+                            PropertyValue::Binary(b) => {
+                                // Sanity-check: real HTML starts with '<' (possibly after BOM/whitespace).
+                                // If it doesn't, it's likely compressed/binary — skip it.
+                                let s = String::from_utf8_lossy(b.buffer());
+                                if s.trim_start().starts_with('<') {
+                                    Some(html_to_text(&s))
+                                } else {
+                                    None
+                                }
+                            }
+                            PropertyValue::String8(s) => Some(html_to_text(&s.to_string())),
+                            PropertyValue::Unicode(s) => Some(html_to_text(&s.to_string())),
                             _ => None,
                         })
                     })
                     .or_else(|| {
                         props.get(0x1009).and_then(|value| match value {
-                            PropertyValue::Binary(b) => String::from_utf8(b.buffer().to_vec()).ok(),
+                            PropertyValue::Binary(b) => rtf_compressed_to_text(b.buffer()),
                             _ => None,
                         })
                     })
@@ -544,6 +673,9 @@ fn browse_pst(file_path: &PathBuf, debug: bool) -> Result<(), Box<dyn std::error
 
                     // Main loop
                     while !app_state.exit {
+                        // Load subjects for the currently visible window before drawing.
+                        app_state.load_visible_subjects(&browser);
+
                         if let Err(e) =
                             terminal.draw(|frame| draw_ui(frame, &browser, &mut app_state))
                         {
@@ -681,10 +813,20 @@ fn draw_messages_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Re
 }
 
 fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
-    let items: Vec<ListItem> = state
-        .messages
-        .iter()
-        .map(|subject| ListItem::new(subject.as_str()))
+    // Record visible height so load_visible_subjects knows the window size.
+    // Subtract 2 for the border.
+    state.message_list_height = area.height.saturating_sub(2) as usize;
+
+    let count = state.message_row_ids.len();
+    let title = format!("Messages ({}/{})", state.message_list_state.selected().map(|i| i + 1).unwrap_or(0), count);
+
+    let items: Vec<ListItem> = (0..count)
+        .map(|i| {
+            let text = state.message_subjects[i]
+                .as_deref()
+                .unwrap_or("…");
+            ListItem::new(text.to_string())
+        })
         .collect();
 
     let border_style = if state.active_pane == ActivePane::Messages {
@@ -698,7 +840,7 @@ fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title("Messages"),
+                .title(title),
         )
         .highlight_style(
             Style::default()
@@ -805,7 +947,7 @@ fn handle_events(
                     ActivePane::Folders => {
                         state.active_pane = ActivePane::Messages;
                         if state.message_list_state.selected().is_none()
-                            && !state.messages.is_empty()
+                            && !state.message_row_ids.is_empty()
                         {
                             state.message_list_state.select(Some(0));
                         }
@@ -834,9 +976,9 @@ fn handle_events(
                     let next = state
                         .message_list_state
                         .selected()
-                        .map(|i| (i + 1).min(state.messages.len().saturating_sub(1)))
+                        .map(|i| (i + 1).min(state.message_row_ids.len().saturating_sub(1)))
                         .unwrap_or(0);
-                    if !state.messages.is_empty() {
+                    if !state.message_row_ids.is_empty() {
                         state.message_list_state.select(Some(next));
                         state.select_message(browser, next);
                     }
@@ -917,7 +1059,7 @@ fn handle_events(
                     state.folders.len(),
                     messages_folder_name,
                     raw_row_count,
-                    state.messages.len(),
+                    state.message_row_ids.len(),
                     state.folder_list_state.selected(),
                     state.message_list_state.selected(),
                     state.preview_scroll,
@@ -949,11 +1091,13 @@ fn handle_events(
                 if !state.folders.is_empty() {
                     state.preview_folder(browser, 0);
                 } else {
-                    let (messages, content) =
-                        AppState::get_messages(browser, &state.current_folder);
-                    state.messages = messages;
-                    state.current_message_content = content;
-                    state.messages_folder = Rc::clone(&state.current_folder);
+                    let folder = Rc::clone(&state.current_folder);
+                    state.set_messages_folder(folder);
+                    state.current_message_content = if state.message_row_ids.is_empty() {
+                        "No messages in this folder".to_string()
+                    } else {
+                        "Select a message to view its content".to_string()
+                    };
                 }
             }
             _ => {}
@@ -1018,7 +1162,7 @@ mod tests {
                             let subj = props.get(0x0037).and_then(prop_to_string).unwrap_or("(none)".into());
                             let body_plain = props.get(0x1000).and_then(prop_to_string);
                             let body_html = props.get(0x1013).and_then(|v| match v {
-                                PropertyValue::Binary(b) => String::from_utf8(b.buffer().to_vec()).ok(),
+                                PropertyValue::Binary(b) => Some(String::from_utf8_lossy(b.buffer()).into_owned()),
                                 _ => prop_to_string(v),
                             });
                             eprintln!("{}{}/{}  plain={} html={}",
