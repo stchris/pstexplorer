@@ -188,6 +188,7 @@ struct PstBrowser {
 enum ActivePane {
     Folders,
     Messages,
+    Preview,
 }
 
 struct AppState {
@@ -199,6 +200,7 @@ struct AppState {
     messages: Vec<String>,
     current_message_content: String,
     active_pane: ActivePane,
+    preview_scroll: u16,
 }
 
 impl PstBrowser {
@@ -226,6 +228,7 @@ impl AppState {
             messages,
             current_message_content,
             active_pane: ActivePane::Folders,
+            preview_scroll: 0,
         }
     }
 
@@ -375,6 +378,7 @@ impl AppState {
                             })
                     })
                     .unwrap_or_else(|| "No message content available".to_string());
+                self.preview_scroll = 0;
             }
         }
     }
@@ -459,8 +463,9 @@ fn draw_ui(frame: &mut ratatui::Frame, _browser: &PstBrowser, state: &mut AppSta
     draw_messages_pane(frame, state, main_layout[1]);
 
     let help = match state.active_pane {
-        ActivePane::Folders => " [Folders] j/k: navigate  Enter/l: open  h: back  Tab: switch to messages  q: quit",
-        ActivePane::Messages => " [Messages] j/k: navigate  Enter: view  Tab: switch to folders  q: quit",
+        ActivePane::Folders => " [Folders] j/k: navigate  Enter/l: open  h: back  Tab: → messages  q: quit",
+        ActivePane::Messages => " [Messages] j/k: navigate  Enter: view  Tab: → preview  q: quit",
+        ActivePane::Preview => " [Preview] j/k: scroll  Tab: → folders  q: quit",
     };
     let status = ratatui::widgets::Paragraph::new(help)
         .style(Style::default().fg(ratatui::style::Color::DarkGray));
@@ -545,13 +550,21 @@ fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
 }
 
 fn draw_message_preview(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let border_style = if state.active_pane == ActivePane::Preview {
+        Style::default().fg(ratatui::style::Color::Cyan)
+    } else {
+        Style::default()
+    };
+
     let preview = Paragraph::new(state.current_message_content.as_str())
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(border_style)
                 .title("Message Preview"),
         )
-        .wrap(ratatui::widgets::Wrap { trim: true });
+        .wrap(ratatui::widgets::Wrap { trim: true })
+        .scroll((state.preview_scroll, 0));
 
     frame.render_widget(preview, area);
 }
@@ -577,6 +590,9 @@ fn handle_events(
                         }
                     }
                     ActivePane::Messages => {
+                        state.active_pane = ActivePane::Preview;
+                    }
+                    ActivePane::Preview => {
                         state.active_pane = ActivePane::Folders;
                     }
                 }
@@ -603,6 +619,9 @@ fn handle_events(
                         state.select_message(browser, next);
                     }
                 }
+                ActivePane::Preview => {
+                    state.preview_scroll = state.preview_scroll.saturating_add(1);
+                }
             },
             KeyCode::Char('k') | KeyCode::Up => match state.active_pane {
                 ActivePane::Folders => {
@@ -620,6 +639,9 @@ fn handle_events(
                         state.select_message(browser, i - 1);
                     }
                 }
+                ActivePane::Preview => {
+                    state.preview_scroll = state.preview_scroll.saturating_sub(1);
+                }
             },
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
                 match state.active_pane {
@@ -631,8 +653,10 @@ fn handle_events(
                     ActivePane::Messages => {
                         if let Some(selected) = state.message_list_state.selected() {
                             state.select_message(browser, selected);
+                            state.active_pane = ActivePane::Preview;
                         }
                     }
+                    ActivePane::Preview => {}
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => {
