@@ -174,6 +174,9 @@ enum Commands {
         /// Search query (case-insensitive, matched against from, to, cc, and body)
         #[arg(required = true)]
         query: String,
+        /// Output format (csv, tsv, or json). Omit for human-readable output.
+        #[arg(long)]
+        format: Option<OutputFormat>,
     },
     /// Browse PST file contents in a TUI
     Browse {
@@ -552,7 +555,22 @@ fn collect_emails(
     Ok(())
 }
 
-fn search_emails(file_path: &PathBuf, query: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// A single search result record for structured output.
+#[derive(Serialize)]
+struct SearchRecord {
+    folder: String,
+    subject: String,
+    from: String,
+    to: String,
+    cc: String,
+    date: String,
+}
+
+fn search_emails(
+    file_path: &PathBuf,
+    query: &str,
+    format: Option<&OutputFormat>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let query_lower = query.to_ascii_lowercase();
     let pst = UnicodePstFile::open(file_path)?;
     let store = Rc::new(UnicodeStore::read(Rc::new(pst))?);
@@ -561,8 +579,165 @@ fn search_emails(file_path: &PathBuf, query: &str) -> Result<(), Box<dyn std::er
         Rc::clone(&store),
         &ipm_sub_tree_entry_id,
     )?;
-    let total = search_traverse_folders(Rc::clone(&store), &ipm_subtree_folder, &query_lower)?;
-    println!("\nFound {} matching emails", total);
+
+    match format {
+        Some(fmt) => {
+            let mut records: Vec<SearchRecord> = Vec::new();
+            collect_search_matches(
+                Rc::clone(&store),
+                &ipm_subtree_folder,
+                &query_lower,
+                &mut records,
+            )?;
+
+            match fmt {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&records)?);
+                }
+                OutputFormat::Csv => {
+                    println!("folder,subject,from,to,cc,date");
+                    for r in &records {
+                        println!(
+                            "{},{},{},{},{},{}",
+                            csv_escape(&r.folder),
+                            csv_escape(&r.subject),
+                            csv_escape(&r.from),
+                            csv_escape(&r.to),
+                            csv_escape(&r.cc),
+                            csv_escape(&r.date),
+                        );
+                    }
+                }
+                OutputFormat::Tsv => {
+                    println!("folder\tsubject\tfrom\tto\tcc\tdate");
+                    for r in &records {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{}",
+                            tsv_escape(&r.folder),
+                            tsv_escape(&r.subject),
+                            tsv_escape(&r.from),
+                            tsv_escape(&r.to),
+                            tsv_escape(&r.cc),
+                            tsv_escape(&r.date),
+                        );
+                    }
+                }
+            }
+        }
+        None => {
+            let total = search_traverse_folders(
+                Rc::clone(&store),
+                &ipm_subtree_folder,
+                &query_lower,
+            )?;
+            println!("\nFound {} matching emails", total);
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively collect matching search results into a Vec.
+fn collect_search_matches(
+    store: Rc<UnicodeStore>,
+    folder: &outlook_pst::messaging::folder::UnicodeFolder,
+    query_lower: &str,
+    records: &mut Vec<SearchRecord>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let folder_name = folder
+        .properties()
+        .display_name()
+        .unwrap_or_else(|_| "Unknown".to_string());
+
+    if let Some(contents_table) = folder.contents_table() {
+        for message_row in contents_table.rows_matrix() {
+            let message_entry_id = store
+                .properties()
+                .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
+                    message_row.id(),
+                )))?;
+
+            if let Ok(message) = outlook_pst::messaging::message::UnicodeMessage::read(
+                store.clone(),
+                &message_entry_id,
+                Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0E06, 0x1000, 0x1013, 0x1009]),
+            ) {
+                let props = message.properties();
+
+                let get_str = |id: u16| -> String {
+                    props
+                        .get(id)
+                        .and_then(|v| match v {
+                            PropertyValue::String8(s) => Some(s.to_string()),
+                            PropertyValue::Unicode(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                        .unwrap_or_default()
+                };
+
+                let from = get_str(0x0C1A);
+                let to = get_str(0x0E04);
+                let cc = get_str(0x0E02);
+                let subject = get_str(0x0037);
+
+                let get_str_prop = |id: u16| -> Option<String> {
+                    props.get(id).and_then(|v| match v {
+                        PropertyValue::String8(s) => Some(s.to_string()),
+                        PropertyValue::Unicode(s) => Some(s.to_string()),
+                        _ => None,
+                    })
+                };
+                let body = if let Some(s) = get_str_prop(0x1000) {
+                    s
+                } else if let Some(html) = get_str_prop(0x1013) {
+                    html_to_text(&html)
+                } else if let Some(PropertyValue::Binary(rtf)) = props.get(0x1009) {
+                    rtf_compressed_to_text(rtf.buffer()).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                let matches = [&from, &to, &cc, &body]
+                    .iter()
+                    .any(|s| s.to_ascii_lowercase().contains(query_lower));
+
+                if matches {
+                    let date = props
+                        .get(0x0E06)
+                        .and_then(|v| match v {
+                            PropertyValue::Time(t) => Some(filetime_to_string(*t)),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+
+                    records.push(SearchRecord {
+                        folder: folder_name.clone(),
+                        subject,
+                        from,
+                        to,
+                        cc,
+                        date,
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(hierarchy_table) = folder.hierarchy_table() {
+        for subfolder_row in hierarchy_table.rows_matrix() {
+            let subfolder_entry_id = store
+                .properties()
+                .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
+                    subfolder_row.id(),
+                )))?;
+            let subfolder = outlook_pst::messaging::folder::UnicodeFolder::read(
+                store.clone(),
+                &subfolder_entry_id,
+            )?;
+            collect_search_matches(store.clone(), &subfolder, query_lower, records)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -589,7 +764,6 @@ fn search_traverse_folders(
             if let Ok(message) = outlook_pst::messaging::message::UnicodeMessage::read(
                 store.clone(),
                 &message_entry_id,
-                // Subject, From, To, CC, Received Time, Plain body, HTML body, RTF body
                 Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0E06, 0x1000, 0x1013, 0x1009]),
             ) {
                 let props = message.properties();
@@ -610,7 +784,6 @@ fn search_traverse_folders(
                 let cc = get_str(0x0E02);
                 let subject = get_str(0x0037);
 
-                // Resolve body: plain text, then HTML, then RTF
                 let get_str_prop = |id: u16| -> Option<String> {
                     props.get(id).and_then(|v| match v {
                         PropertyValue::String8(s) => Some(s.to_string()),
@@ -1677,8 +1850,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Search { file, query } => {
-            if let Err(e) = search_emails(file, query) {
+        Commands::Search { file, query, format } => {
+            if let Err(e) = search_emails(file, query, format.as_ref()) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
