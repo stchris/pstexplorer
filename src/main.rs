@@ -173,6 +173,186 @@ enum Commands {
         #[arg(long)]
         debug: bool,
     },
+    /// Print statistics about a PST file
+    Stats {
+        /// Path to the PST file
+        #[arg(required = true)]
+        file: PathBuf,
+    },
+}
+
+/// Accumulated statistics gathered while walking the PST folder tree.
+struct PstStats {
+    folder_count: usize,
+    email_count: usize,
+    attachment_count: usize,
+    calendar_count: usize,
+    contact_count: usize,
+    task_count: usize,
+    note_count: usize,
+    earliest_ts: Option<i64>,
+    latest_ts: Option<i64>,
+}
+
+impl PstStats {
+    fn new() -> Self {
+        PstStats {
+            folder_count: 0,
+            email_count: 0,
+            attachment_count: 0,
+            calendar_count: 0,
+            contact_count: 0,
+            task_count: 0,
+            note_count: 0,
+            earliest_ts: None,
+            latest_ts: None,
+        }
+    }
+
+    fn update_timestamp(&mut self, ts: i64) {
+        self.earliest_ts = Some(match self.earliest_ts {
+            Some(e) => e.min(ts),
+            None => ts,
+        });
+        self.latest_ts = Some(match self.latest_ts {
+            Some(l) => l.max(ts),
+            None => ts,
+        });
+    }
+}
+
+fn collect_stats(
+    store: Rc<UnicodeStore>,
+    folder: &UnicodeFolder,
+    stats: &mut PstStats,
+) {
+    stats.folder_count += 1;
+
+    if let Some(contents_table) = folder.contents_table() {
+        for row in contents_table.rows_matrix() {
+            let row_id = u32::from(row.id());
+            let entry_id = match store.properties().make_entry_id(NodeId::from(row_id)) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            let message = match UnicodeMessage::read(
+                Rc::clone(&store),
+                &entry_id,
+                // Subject, MessageClass, ReceivedTime, ClientSubmitTime, AttachCount
+                Some(&[0x0037, 0x001A, 0x0E06, 0x0039, 0x0E13]),
+            ) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let props = message.properties();
+
+            // Determine item type from PR_MESSAGE_CLASS (0x001A)
+            let message_class: String = props
+                .get(0x001A)
+                .and_then(|v| match v {
+                    PropertyValue::String8(s) => Some(s.to_string().to_ascii_uppercase()),
+                    PropertyValue::Unicode(s) => Some(s.to_string().to_ascii_uppercase()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            if message_class.starts_with("IPM.NOTE") || message_class.is_empty() || message_class == "IPM" {
+                stats.email_count += 1;
+            } else if message_class.starts_with("IPM.APPOINTMENT") || message_class.starts_with("IPM.SCHEDULE") {
+                stats.calendar_count += 1;
+            } else if message_class.starts_with("IPM.CONTACT") {
+                stats.contact_count += 1;
+            } else if message_class.starts_with("IPM.TASK") {
+                stats.task_count += 1;
+            } else if message_class.starts_with("IPM.STICKYNOTE") {
+                stats.note_count += 1;
+            } else {
+                // Treat anything else as an email-like item
+                stats.email_count += 1;
+            }
+
+            // PR_ATTACH_NUM (0x0E13) gives the count of attachments on this message
+            if let Some(PropertyValue::Integer32(n)) = props.get(0x0E13) {
+                if *n > 0 {
+                    stats.attachment_count += *n as usize;
+                }
+            }
+
+            // Record timestamp: prefer PR_CLIENT_SUBMIT_TIME (0x0039), fall back to
+            // PR_MESSAGE_DELIVERY_TIME (0x0E06)
+            let ts = props
+                .get(0x0039)
+                .or_else(|| props.get(0x0E06))
+                .and_then(|v| match v {
+                    PropertyValue::Time(t) => Some(*t),
+                    _ => None,
+                });
+            if let Some(t) = ts {
+                stats.update_timestamp(t);
+            }
+        }
+    }
+
+    if let Some(hierarchy_table) = folder.hierarchy_table() {
+        for row in hierarchy_table.rows_matrix() {
+            let Ok(entry_id) = store
+                .properties()
+                .make_entry_id(NodeId::from(u32::from(row.id())))
+            else {
+                continue;
+            };
+            let Ok(subfolder) = UnicodeFolder::read(Rc::clone(&store), &entry_id) else {
+                continue;
+            };
+            collect_stats(Rc::clone(&store), &subfolder, stats);
+        }
+    }
+}
+
+fn stats_pst(file_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let pst = UnicodePstFile::open(file_path)?;
+    let store = Rc::new(UnicodeStore::read(Rc::new(pst))?);
+    let ipm_sub_tree_entry_id = store.properties().ipm_sub_tree_entry_id()?;
+    let ipm_subtree_folder = UnicodeFolder::read(Rc::clone(&store), &ipm_sub_tree_entry_id)?;
+
+    let mut stats = PstStats::new();
+    collect_stats(Rc::clone(&store), &ipm_subtree_folder, &mut stats);
+
+    let total_items = stats.email_count
+        + stats.calendar_count
+        + stats.contact_count
+        + stats.task_count
+        + stats.note_count;
+
+    println!("PST Statistics: {:?}", file_path);
+    println!("  Folders:          {}", stats.folder_count);
+    println!("  Total items:      {}", total_items);
+    println!("  Emails:           {}", stats.email_count);
+    if stats.calendar_count > 0 {
+        println!("  Calendar items:   {}", stats.calendar_count);
+    }
+    if stats.contact_count > 0 {
+        println!("  Contacts:         {}", stats.contact_count);
+    }
+    if stats.task_count > 0 {
+        println!("  Tasks:            {}", stats.task_count);
+    }
+    if stats.note_count > 0 {
+        println!("  Notes:            {}", stats.note_count);
+    }
+    println!("  Attachments:      {}", stats.attachment_count);
+    match (stats.earliest_ts, stats.latest_ts) {
+        (Some(e), Some(l)) => {
+            println!("  Earliest message: {}", filetime_to_string(e));
+            println!("  Latest message:   {}", filetime_to_string(l));
+        }
+        _ => {
+            println!("  Date range:       (no timestamps found)");
+        }
+    }
+    Ok(())
 }
 
 fn list_emails(file_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -1339,6 +1519,12 @@ fn main() {
         }
         Commands::Browse { file, debug } => {
             if let Err(e) = browse_pst(file, *debug) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Stats { file } => {
+            if let Err(e) = stats_pst(file) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
