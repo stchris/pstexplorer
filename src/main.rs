@@ -19,7 +19,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use chrono::{TimeZone, Utc};
-use std::{io, path::PathBuf, rc::Rc};
+use std::{io, path::PathBuf, rc::Rc, time::Instant};
 
 /// Convert a Windows FILETIME (100-ns ticks since 1601-01-01 UTC) to a
 /// human-readable UTC string, e.g. "2010-11-24 15:24:27 UTC".
@@ -627,6 +627,10 @@ struct AppState {
     search_bar_active: bool,
     /// Whether we are currently showing search results instead of all messages.
     search_mode: bool,
+    /// Set when Enter is pressed in search bar; cleared after search completes.
+    search_pending: bool,
+    /// When the current/last search started (for elapsed-time display).
+    search_start: Option<Instant>,
 }
 
 impl PstBrowser {
@@ -674,6 +678,8 @@ impl AppState {
             search_input: String::new(),
             search_bar_active: false,
             search_mode: false,
+            search_pending: false,
+            search_start: None,
         }
     }
 
@@ -846,6 +852,38 @@ fn browse_pst(file_path: &PathBuf, debug: bool) -> Result<(), Box<dyn std::error
                             eprintln!("Error drawing UI: {}", e);
                             break;
                         }
+
+                        // Run any pending search after drawing so the "Searching..." status
+                        // is visible for at least one frame before blocking.
+                        if app_state.search_pending {
+                            app_state.search_pending = false;
+                            let results = run_search(&browser, &app_state.search_input);
+                            let elapsed = app_state.search_start
+                                .take()
+                                .map(|t| t.elapsed().as_secs())
+                                .unwrap_or(0);
+                            let n = results.len();
+                            app_state.search_mode = true;
+                            app_state.message_row_ids = results.iter().map(|r| r.row_id).collect();
+                            app_state.message_folder_names = results.iter().map(|r| r.folder_name.clone()).collect();
+                            app_state.message_subjects = results.iter().map(|r| Some(r.subject.clone())).collect();
+                            app_state.message_list_state = ListState::default();
+                            if n > 0 {
+                                app_state.message_list_state.select(Some(0));
+                                app_state.select_message(&browser, 0);
+                            } else {
+                                app_state.current_headers = MessageHeaders::default();
+                                app_state.current_message_content = "No messages match the search query".to_string();
+                            }
+                            app_state.preview_scroll = 0;
+                            app_state.active_pane = ActivePane::Messages;
+                            app_state.status_message = Some(format!(
+                                "Found {} result{} ({}s)",
+                                n, if n == 1 { "" } else { "s" }, elapsed
+                            ));
+                            continue; // redraw immediately to show results
+                        }
+
                         if let Err(e) = handle_events(&mut app_state, &browser) {
                             eprintln!("Error handling events: {}", e);
                             break;
@@ -1103,22 +1141,8 @@ fn handle_events(
                 KeyCode::Enter => {
                     state.search_bar_active = false;
                     if !state.search_input.is_empty() {
-                        let results = run_search(browser, &state.search_input);
-                        let n = results.len();
-                        state.search_mode = true;
-                        state.message_row_ids = results.iter().map(|r| r.row_id).collect();
-                        state.message_folder_names = results.iter().map(|r| r.folder_name.clone()).collect();
-                        state.message_subjects = results.iter().map(|r| Some(r.subject.clone())).collect();
-                        state.message_list_state = ListState::default();
-                        if n > 0 {
-                            state.message_list_state.select(Some(0));
-                            state.select_message(browser, 0);
-                        } else {
-                            state.current_headers = MessageHeaders::default();
-                            state.current_message_content = "No messages match the search query".to_string();
-                        }
-                        state.preview_scroll = 0;
-                        state.active_pane = ActivePane::Messages;
+                        state.search_pending = true;
+                        state.search_start = Some(Instant::now());
                     } else {
                         state.restore_all_messages();
                     }
