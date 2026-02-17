@@ -332,9 +332,10 @@ fn collect_stats(store: Rc<UnicodeStore>, folder: &UnicodeFolder, stats: &mut Ps
 
             // PR_ATTACH_NUM (0x0E13) gives the count of attachments on this message
             if let Some(PropertyValue::Integer32(n)) = props.get(0x0E13)
-                && *n > 0 {
-                    stats.attachment_count += *n as usize;
-                }
+                && *n > 0
+            {
+                stats.attachment_count += *n as usize;
+            }
 
             // Record timestamp: prefer PR_CLIENT_SUBMIT_TIME (0x0039), fall back to
             // PR_MESSAGE_DELIVERY_TIME (0x0E06)
@@ -2671,7 +2672,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(count >= 1, "expected at least one 'Feature Generators' message");
+        assert!(
+            count >= 1,
+            "expected at least one 'Feature Generators' message"
+        );
 
         // Verify folder paths are populated
         let root_path: String = conn
