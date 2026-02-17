@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 use chrono::{TimeZone, Utc};
 use std::{io, path::PathBuf, rc::Rc, time::Instant};
@@ -365,7 +365,7 @@ fn collect_search_results(
             let message = match UnicodeMessage::read(
                 Rc::clone(&store),
                 &entry_id,
-                Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x1000, 0x1013, 0x1009]),
+                Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06, 0x1000, 0x1013, 0x1009]),
             ) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -410,9 +410,17 @@ fn collect_search_results(
                 .any(|s| s.to_ascii_lowercase().contains(query_lower));
 
             if matches {
+                let date = props
+                    .get(0x0039)
+                    .or_else(|| props.get(0x0E06))
+                    .and_then(|v| match v {
+                        PropertyValue::Time(t) => Some(filetime_to_string(*t)),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 results.push(SearchResultItem {
                     folder_name: folder_name.clone(),
-                    subject,
+                    row_data: MessageRow { from, to, cc, subject, date },
                     row_id,
                 });
             }
@@ -577,9 +585,44 @@ struct PstBrowser {
     root_folder: Rc<UnicodeFolder>,
 }
 
+#[derive(Clone, Default)]
+struct MessageRow {
+    from: String,
+    to: String,
+    cc: String,
+    subject: String,
+    date: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnId {
+    From,
+    To,
+    Cc,
+    Subject,
+    Date,
+}
+
+struct ColumnConfig {
+    id: ColumnId,
+    label: &'static str,
+    width: Constraint,
+    visible: bool,
+}
+
+fn default_columns() -> Vec<ColumnConfig> {
+    vec![
+        ColumnConfig { id: ColumnId::From,    label: "From",    width: Constraint::Percentage(20), visible: true },
+        ColumnConfig { id: ColumnId::To,      label: "To",      width: Constraint::Percentage(20), visible: true },
+        ColumnConfig { id: ColumnId::Cc,      label: "CC",      width: Constraint::Percentage(15), visible: false },
+        ColumnConfig { id: ColumnId::Subject, label: "Subject", width: Constraint::Percentage(40), visible: true },
+        ColumnConfig { id: ColumnId::Date,    label: "Date",    width: Constraint::Percentage(20), visible: true },
+    ]
+}
+
 struct SearchResultItem {
     folder_name: String,
-    subject: String,
+    row_data: MessageRow,
     row_id: u32,
 }
 
@@ -608,9 +651,11 @@ struct AppState {
     message_row_ids: Vec<u32>,
     /// Folder name for each entry in message_row_ids.
     message_folder_names: Vec<String>,
-    /// Lazily loaded subjects; None = not yet fetched.
-    message_subjects: Vec<Option<String>>,
-    message_list_state: ListState,
+    /// Lazily loaded row data; None = not yet fetched.
+    message_rows: Vec<Option<MessageRow>>,
+    message_table_state: TableState,
+    /// Column configuration for the message table.
+    columns: Vec<ColumnConfig>,
     /// Height of the message list area as of the last draw — used to size the load window.
     message_list_height: usize,
     current_message_content: String,
@@ -651,9 +696,9 @@ impl AppState {
         let all_folder_names: Vec<String> = all_messages.iter().map(|(n, _)| n.clone()).collect();
         let n = all_row_ids.len();
 
-        let mut message_list_state = ListState::default();
+        let mut message_table_state = TableState::default();
         if n > 0 {
-            message_list_state.select(Some(0));
+            message_table_state.select(Some(0));
         }
 
         Self {
@@ -662,8 +707,9 @@ impl AppState {
             message_folder_names: all_folder_names.clone(),
             all_row_ids,
             all_folder_names,
-            message_subjects: vec![None; n],
-            message_list_state,
+            message_rows: vec![None; n],
+            message_table_state,
+            columns: default_columns(),
             message_list_height: 20,
             current_message_content: if n == 0 {
                 "No messages found".to_string()
@@ -683,29 +729,58 @@ impl AppState {
         }
     }
 
-    /// Load subjects for the visible window around the current scroll offset.
-    fn load_visible_subjects(&mut self, browser: &PstBrowser) {
-        let offset = self.message_list_state.offset();
+    /// Load row data for the visible window around the current scroll offset.
+    fn load_visible_rows(&mut self, browser: &PstBrowser) {
+        let offset = self.message_table_state.offset();
         let end = (offset + self.message_list_height + 5).min(self.message_row_ids.len());
         for i in offset..end {
-            if self.message_subjects[i].is_none() {
-                let subject = browser
+            if self.message_rows[i].is_none() {
+                let row = browser
                     .store
                     .properties()
                     .make_entry_id(NodeId::from(self.message_row_ids[i]))
                     .ok()
                     .and_then(|eid| {
-                        UnicodeMessage::read(Rc::clone(&browser.store), &eid, Some(&[0x0037])).ok()
+                        UnicodeMessage::read(
+                            Rc::clone(&browser.store),
+                            &eid,
+                            Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06]),
+                        )
+                        .ok()
                     })
-                    .and_then(|msg| {
-                        msg.properties().get(0x0037).and_then(|v| match v {
-                            PropertyValue::String8(s) => Some(s.to_string()),
-                            PropertyValue::Unicode(s) => Some(s.to_string()),
-                            _ => None,
-                        })
+                    .map(|msg| {
+                        let props = msg.properties();
+                        let get_str = |id: u16| -> String {
+                            props
+                                .get(id)
+                                .and_then(|v| match v {
+                                    PropertyValue::String8(s) => Some(s.to_string()),
+                                    PropertyValue::Unicode(s) => Some(s.to_string()),
+                                    _ => None,
+                                })
+                                .unwrap_or_default()
+                        };
+                        let date = props
+                            .get(0x0039)
+                            .or_else(|| props.get(0x0E06))
+                            .and_then(|v| match v {
+                                PropertyValue::Time(t) => Some(filetime_to_string(*t)),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        MessageRow {
+                            from: get_str(0x0C1A),
+                            to: get_str(0x0E04),
+                            cc: get_str(0x0E02),
+                            subject: get_str(0x0037),
+                            date,
+                        }
                     })
-                    .unwrap_or_else(|| "(no subject)".to_string());
-                self.message_subjects[i] = Some(subject);
+                    .unwrap_or_else(|| MessageRow {
+                        subject: "(no subject)".to_string(),
+                        ..Default::default()
+                    });
+                self.message_rows[i] = Some(row);
             }
         }
     }
@@ -720,11 +795,11 @@ impl AppState {
         let n = self.all_row_ids.len();
         self.message_row_ids = self.all_row_ids.clone();
         self.message_folder_names = self.all_folder_names.clone();
-        self.message_subjects = vec![None; n];
+        self.message_rows = vec![None; n];
         self.search_mode = false;
         self.search_input.clear();
-        self.message_list_state = ListState::default();
-        if n > 0 { self.message_list_state.select(Some(0)); }
+        self.message_table_state = TableState::default();
+        if n > 0 { self.message_table_state.select(Some(0)); }
         self.current_headers = MessageHeaders::default();
         self.current_message_content = "Select a message to view its content".to_string();
         self.preview_scroll = 0;
@@ -843,8 +918,8 @@ fn browse_pst(file_path: &PathBuf, debug: bool) -> Result<(), Box<dyn std::error
 
                     // Main loop
                     while !app_state.exit {
-                        // Load subjects for the currently visible window before drawing.
-                        app_state.load_visible_subjects(&browser);
+                        // Load row data for the currently visible window before drawing.
+                        app_state.load_visible_rows(&browser);
 
                         if let Err(e) =
                             terminal.draw(|frame| draw_ui(frame, &browser, &mut app_state))
@@ -866,10 +941,10 @@ fn browse_pst(file_path: &PathBuf, debug: bool) -> Result<(), Box<dyn std::error
                             app_state.search_mode = true;
                             app_state.message_row_ids = results.iter().map(|r| r.row_id).collect();
                             app_state.message_folder_names = results.iter().map(|r| r.folder_name.clone()).collect();
-                            app_state.message_subjects = results.iter().map(|r| Some(r.subject.clone())).collect();
-                            app_state.message_list_state = ListState::default();
+                            app_state.message_rows = results.iter().map(|r| Some(r.row_data.clone())).collect();
+                            app_state.message_table_state = TableState::default();
                             if n > 0 {
-                                app_state.message_list_state.select(Some(0));
+                                app_state.message_table_state.select(Some(0));
                                 app_state.select_message(&browser, 0);
                             } else {
                                 app_state.current_headers = MessageHeaders::default();
@@ -1005,25 +1080,57 @@ fn draw_search_bar(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
-    // Record visible height so load_visible_subjects knows the window size.
-    // Subtract 2 for the border.
-    state.message_list_height = area.height.saturating_sub(2) as usize;
+    // Subtract 3 for border top + header row + border bottom.
+    state.message_list_height = area.height.saturating_sub(3) as usize;
 
     let count = state.message_row_ids.len();
-    let selected_num = state.message_list_state.selected().map(|i| i + 1).unwrap_or(0);
+    let selected_num = state.message_table_state.selected().map(|i| i + 1).unwrap_or(0);
     let title = if state.search_mode {
         format!("Search Results ({}/{})", selected_num, count)
     } else {
         format!("Messages ({}/{})", selected_num, count)
     };
 
-    let items: Vec<ListItem> = (0..count)
-        .map(|i| {
-            let folder = state.message_folder_names.get(i).map(|s| s.as_str()).unwrap_or("?");
-            let subject = state.message_subjects[i].as_deref().unwrap_or("…");
-            ListItem::new(format!("{} | {}", folder, subject))
+    let visible_cols: Vec<&ColumnConfig> = state.columns.iter().filter(|c| c.visible).collect();
+
+    let header_cells: Vec<Cell> = visible_cols
+        .iter()
+        .map(|col| {
+            Cell::from(col.label).style(
+                Style::default()
+                    .fg(ratatui::style::Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
         })
         .collect();
+    let header = Row::new(header_cells).bottom_margin(0);
+
+    let empty = MessageRow::default();
+    let rows: Vec<Row> = (0..count)
+        .map(|i| {
+            let row_data = state.message_rows[i].as_ref().unwrap_or(&empty);
+            let cells: Vec<Cell> = visible_cols
+                .iter()
+                .map(|col| {
+                    let val = match col.id {
+                        ColumnId::From => &row_data.from,
+                        ColumnId::To => &row_data.to,
+                        ColumnId::Cc => &row_data.cc,
+                        ColumnId::Subject => &row_data.subject,
+                        ColumnId::Date => &row_data.date,
+                    };
+                    Cell::from(if val.is_empty() && matches!(col.id, ColumnId::Subject) {
+                        "\u{2026}" // ellipsis for loading
+                    } else {
+                        val.as_str()
+                    })
+                })
+                .collect();
+            Row::new(cells)
+        })
+        .collect();
+
+    let widths: Vec<Constraint> = visible_cols.iter().map(|c| c.width).collect();
 
     let border_style = if state.active_pane == ActivePane::Messages {
         Style::default().fg(ratatui::style::Color::Cyan)
@@ -1031,20 +1138,21 @@ fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         Style::default()
     };
 
-    let list = List::new(items)
+    let table = Table::new(rows, &widths)
+        .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
                 .title(title),
         )
-        .highlight_style(
+        .row_highlight_style(
             Style::default()
                 .fg(ratatui::style::Color::Green)
-                .add_modifier(ratatui::style::Modifier::BOLD),
+                .add_modifier(Modifier::BOLD),
         );
 
-    frame.render_stateful_widget(list, area, &mut state.message_list_state);
+    frame.render_stateful_widget(table, area, &mut state.message_table_state);
 }
 
 fn draw_message_preview(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
@@ -1126,7 +1234,7 @@ fn handle_events(
         };
         state.log_event(&format!(
             "[KEY] {} | pane={} msg_idx={:?} scroll={}",
-            key_str, pane_name, state.message_list_state.selected(), state.preview_scroll
+            key_str, pane_name, state.message_table_state.selected(), state.preview_scroll
         ));
 
         // --- Search bar input mode ---
@@ -1175,12 +1283,12 @@ fn handle_events(
             KeyCode::Char('j') | KeyCode::Down => match state.active_pane {
                 ActivePane::Messages => {
                     let next = state
-                        .message_list_state
+                        .message_table_state
                         .selected()
                         .map(|i| (i + 1).min(state.message_row_ids.len().saturating_sub(1)))
                         .unwrap_or(0);
                     if !state.message_row_ids.is_empty() {
-                        state.message_list_state.select(Some(next));
+                        state.message_table_state.select(Some(next));
                         state.select_message(browser, next);
                     }
                 }
@@ -1190,10 +1298,10 @@ fn handle_events(
             },
             KeyCode::Char('k') | KeyCode::Up => match state.active_pane {
                 ActivePane::Messages => {
-                    if let Some(i) = state.message_list_state.selected()
+                    if let Some(i) = state.message_table_state.selected()
                         && i > 0
                     {
-                        state.message_list_state.select(Some(i - 1));
+                        state.message_table_state.select(Some(i - 1));
                         state.select_message(browser, i - 1);
                     }
                 }
@@ -1202,7 +1310,7 @@ fn handle_events(
                 }
             },
             KeyCode::Enter => {
-                if let Some(selected) = state.message_list_state.selected() {
+                if let Some(selected) = state.message_table_state.selected() {
                     state.select_message(browser, selected);
                     state.active_pane = ActivePane::Preview;
                 }
