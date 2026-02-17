@@ -17,6 +17,10 @@ Commands:
 
 ## Features
 
+### stats
+
+Print a summary of the PST file: folder count, email/calendar/contact/task/note counts, attachment count, and date range.
+
 ### list
 
 List all emails with subject, sender, recipient, and date. Supports `--format csv|tsv|json` for structured output and `--limit` to cap the number of entries.
@@ -25,14 +29,10 @@ List all emails with subject, sender, recipient, and date. Supports `--format cs
 
 Case-insensitive full-text search across from, to, cc, and body fields. Supports the same `--format` options as `list`.
 
+### export
+
+Export folders and messages to a SQLite database for further analysis. Use `--output` to set the database path and `--limit` to cap the number of exported messages. Suggestion: export to a SQLite db and then use `uvx datasette` to visually browse the data.
+
 ### browse
 
 Interactive terminal UI for navigating folders and reading messages.
-
-### stats
-
-Print a summary of the PST file: folder count, email/calendar/contact/task/note counts, attachment count, and date range.
-
-### export
-
-Export folders and messages to a SQLite database for further analysis. Use `--output` to set the database path and `--limit` to cap the number of exported messages.
