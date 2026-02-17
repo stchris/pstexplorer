@@ -6,7 +6,6 @@ repository = "https://github.com/stchris/pstexplorer"
 description = "A CLI tool to explore and extract data from Outlook PST files"
 homepage = "https://github.com/stchris/pstexplorer"
 license = "MIT OR Apache-2.0"
-publish = false
 
 [dependencies]
 outlook-pst = "1.1"
@@ -26,6 +25,7 @@ inherits = "release"
 lto = "thin"
 
 [workspace.metadata.release]
+publish = false
 pre-release-hook = [
   "git",
   "cliff",
