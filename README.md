@@ -2,6 +2,10 @@
 
 A CLI tool to explore and extract data from Outlook PST files.
 
+## Installation
+
+Check the instructions on the latest [release page](https://github.com/stchris/pstexplorer/releases).
+
 ## Usage
 
 ```
