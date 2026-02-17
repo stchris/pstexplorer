@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 
 ### Other
 
+- Initial
 - Make previews work
 - Make the message preview scrollable
 - Show message headers
@@ -39,5 +40,7 @@ All notable changes to this project will be documented in this file.
 - Cargo-dist
 - A bit of README polishing
 - Add git-cliff
+- Initial changelog
+- Add license
 
 
