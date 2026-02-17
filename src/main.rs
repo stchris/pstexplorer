@@ -1553,6 +1553,121 @@ mod tests {
         }
     }
 
+    // ── sample.pst tests ─────────────────────────────────────────────────────
+
+    /// Verify the folder structure: 5 folders total, including the expected
+    /// named folders from the Aspose sample file.
+    #[test]
+    fn test_sample_pst_folder_count() {
+        let mut stats = PstStats::new();
+        let (store, root) = open_test_store("testdata/sample.pst");
+        collect_stats(Rc::clone(&store), &root, &mut stats);
+        assert_eq!(stats.folder_count, 5);
+    }
+
+    /// Verify that exactly one email exists in the sample PST.
+    #[test]
+    fn test_sample_pst_email_count() {
+        let mut stats = PstStats::new();
+        let (store, root) = open_test_store("testdata/sample.pst");
+        collect_stats(Rc::clone(&store), &root, &mut stats);
+        assert_eq!(stats.email_count, 1);
+        assert_eq!(stats.attachment_count, 0);
+    }
+
+    /// Verify that non-email artifact counts are all zero.
+    #[test]
+    fn test_sample_pst_no_other_artifacts() {
+        let mut stats = PstStats::new();
+        let (store, root) = open_test_store("testdata/sample.pst");
+        collect_stats(Rc::clone(&store), &root, &mut stats);
+        assert_eq!(stats.calendar_count, 0);
+        assert_eq!(stats.contact_count, 0);
+        assert_eq!(stats.task_count, 0);
+        assert_eq!(stats.note_count, 0);
+    }
+
+    /// Verify the subject and sender of the single message in the sample.
+    #[test]
+    fn test_sample_pst_message_fields() {
+        let (store, root) = open_test_store("testdata/sample.pst");
+
+        // Walk folders until we find a message
+        fn find_message(
+            store: &Rc<UnicodeStore>,
+            folder: &UnicodeFolder,
+        ) -> Option<(String, String, String)> {
+            if let Some(table) = folder.contents_table() {
+                for row in table.rows_matrix() {
+                    let entry_id = store
+                        .properties()
+                        .make_entry_id(NodeId::from(u32::from(row.id())))
+                        .ok()?;
+                    let msg = UnicodeMessage::read(
+                        Rc::clone(store),
+                        &entry_id,
+                        Some(&[0x0037, 0x0C1A, 0x0E04]),
+                    )
+                    .ok()?;
+                    let props = msg.properties();
+                    let get = |id: u16| -> String {
+                        props
+                            .get(id)
+                            .and_then(|v| match v {
+                                PropertyValue::String8(s) => Some(s.to_string()),
+                                PropertyValue::Unicode(s) => Some(s.to_string()),
+                                _ => None,
+                            })
+                            .unwrap_or_default()
+                    };
+                    return Some((get(0x0037), get(0x0C1A), get(0x0E04)));
+                }
+            }
+            if let Some(htable) = folder.hierarchy_table() {
+                for row in htable.rows_matrix() {
+                    let entry_id = store
+                        .properties()
+                        .make_entry_id(NodeId::from(u32::from(row.id())))
+                        .ok()?;
+                    if let Ok(sub) = UnicodeFolder::read(Rc::clone(store), &entry_id) {
+                        if let Some(result) = find_message(store, &sub) {
+                            return Some(result);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let (subject, from, to) = find_message(&store, &root)
+            .expect("expected at least one message in sample.pst");
+
+        assert!(
+            subject.contains("Aspose.Email"),
+            "unexpected subject: {subject:?}"
+        );
+        assert_eq!(from, "Sender Name");
+        assert!(to.contains("Recipient 1"), "unexpected To: {to:?}");
+    }
+
+    /// Verify the sample PST has no timestamps (the Aspose sample omits them).
+    #[test]
+    fn test_sample_pst_no_timestamps() {
+        let mut stats = PstStats::new();
+        let (store, root) = open_test_store("testdata/sample.pst");
+        collect_stats(Rc::clone(&store), &root, &mut stats);
+        assert!(
+            stats.earliest_ts.is_none(),
+            "expected no timestamps in sample.pst"
+        );
+        assert!(
+            stats.latest_ts.is_none(),
+            "expected no timestamps in sample.pst"
+        );
+    }
+
+    // ── legacy test (requires testdata/outlook.pst) ───────────────────────────
+
     #[test]
     fn test_message_content_loads() {
         let (store, root) = open_test_store("testdata/outlook.pst");
