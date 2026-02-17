@@ -11,3 +11,5 @@ ratatui = "0.30"
 crossterm = "0.29"
 compressed-rtf = "1.0.0"
 rtf-parser = "0.4.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
