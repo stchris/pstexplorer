@@ -22,3 +22,13 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[workspace.metadata.release]
+pre-release-hook = [
+  "git",
+  "cliff",
+  "-o",
+  "CHANGELOG.md",
+  "--tag",
+  "{{version}}",
+]
