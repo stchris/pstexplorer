@@ -1079,6 +1079,8 @@ dependencies = [
  "outlook-pst",
  "ratatui",
  "rtf-parser",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
