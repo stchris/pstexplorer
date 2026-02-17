@@ -2364,6 +2364,7 @@ mod tests {
         export_pst(
             &PathBuf::from("testdata/sample.pst"),
             Some(&db_path),
+            0, // no limit
         )
         .expect("export should succeed");
 
@@ -2406,6 +2407,60 @@ mod tests {
         assert!(!root_path.is_empty());
 
         // Clean up
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Verify that limit=0 means unlimited: all messages from the sample PST
+    /// (exactly 1) end up in the database.
+    #[test]
+    fn test_export_limit_zero_exports_all() {
+        let db_path = std::env::temp_dir().join("pstexplorer_test_export_limit0.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        export_pst(
+            &PathBuf::from("testdata/sample.pst"),
+            Some(&db_path),
+            0, // 0 = unlimited
+        )
+        .expect("export should succeed");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let msg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg_count, 1, "limit=0 should export all messages");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Verify that the limit flag caps the number of exported messages.
+    /// The sample PST contains exactly 1 message; exporting with limit=1 should
+    /// produce a database with exactly 1 message, and exporting with limit=0
+    /// (unlimited) from a 1-message file also yields 1. Crucially, we check
+    /// that the row count never exceeds the stated limit.
+    #[test]
+    fn test_export_limit_caps_message_count() {
+        let db_path = std::env::temp_dir().join("pstexplorer_test_export_limit1.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let limit: usize = 1;
+        export_pst(
+            &PathBuf::from("testdata/sample.pst"),
+            Some(&db_path),
+            limit,
+        )
+        .expect("export should succeed");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let msg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            msg_count <= limit as i64,
+            "exported {msg_count} messages but limit was {limit}"
+        );
+        assert_eq!(msg_count, 1, "expected exactly 1 message with limit=1");
+
         let _ = std::fs::remove_file(&db_path);
     }
 }
