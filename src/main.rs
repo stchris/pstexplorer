@@ -166,6 +166,9 @@ enum Commands {
         /// Output format (csv, tsv, or json). Omit for human-readable output.
         #[arg(long)]
         format: Option<OutputFormat>,
+        /// Maximum number of entries to output (0 = no limit)
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
     },
     /// Search emails in a PST file by query string (matches from, to, cc, body)
     Search {
@@ -391,6 +394,7 @@ struct EmailRecord {
 fn list_emails(
     file_path: &PathBuf,
     format: Option<&OutputFormat>,
+    limit: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Open the PST file
     let pst = UnicodePstFile::open(file_path)?;
@@ -408,6 +412,13 @@ fn list_emails(
             // Collect all emails then output in the requested format
             let mut records: Vec<EmailRecord> = Vec::new();
             collect_emails(Rc::clone(&store), &ipm_subtree_folder, &mut records)?;
+
+            // Apply limit if set
+            let records: Vec<EmailRecord> = if limit > 0 {
+                records.into_iter().take(limit).collect()
+            } else {
+                records
+            };
 
             match fmt {
                 OutputFormat::Json => {
@@ -450,8 +461,9 @@ fn list_emails(
                 hierarchy_table.rows_matrix().count()
             );
 
+            let mut printed = 0usize;
             let total_emails =
-                traverse_folder_hierarchy(Rc::clone(&store), &ipm_subtree_folder)?;
+                traverse_folder_hierarchy(Rc::clone(&store), &ipm_subtree_folder, limit, &mut printed)?;
             println!("\nFound {} emails in the PST file", total_emails);
         }
     }
@@ -1259,6 +1271,8 @@ fn collect_all_messages(
 fn traverse_folder_hierarchy(
     store: Rc<UnicodeStore>,
     folder: &outlook_pst::messaging::folder::UnicodeFolder,
+    limit: usize,
+    printed: &mut usize,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut email_count = 0;
 
@@ -1279,6 +1293,11 @@ fn traverse_folder_hierarchy(
 
         // Process each message
         for message_row in messages {
+            // Stop printing messages if the limit has been reached
+            if limit > 0 && *printed >= limit {
+                break;
+            }
+
             let message_entry_id =
                 store
                     .properties()
@@ -1336,13 +1355,17 @@ fn traverse_folder_hierarchy(
                 println!("    ---");
 
                 email_count += 1;
+                *printed += 1;
             }
         }
     }
 
-    // Recursively traverse subfolders
+    // Recursively traverse subfolders (stop if limit reached)
     if let Some(hierarchy_table) = folder.hierarchy_table() {
         for subfolder_row in hierarchy_table.rows_matrix() {
+            if limit > 0 && *printed >= limit {
+                break;
+            }
             let subfolder_entry_id =
                 store
                     .properties()
@@ -1353,7 +1376,7 @@ fn traverse_folder_hierarchy(
                 store.clone(),
                 &subfolder_entry_id,
             )?;
-            email_count += traverse_folder_hierarchy(store.clone(), &subfolder)?;
+            email_count += traverse_folder_hierarchy(store.clone(), &subfolder, limit, printed)?;
         }
     }
 
@@ -1768,7 +1791,7 @@ fn browse_pst(file_path: &PathBuf, debug: bool) -> Result<(), Box<dyn std::error
             eprintln!("For now, here's the basic information about the PST file:");
 
             // Fall back to showing basic info
-            list_emails(file_path, None)?;
+            list_emails(file_path, None, 0)?;
         }
     }
 
@@ -2106,8 +2129,8 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::List { file, format } => {
-            if let Err(e) = list_emails(file, format.as_ref()) {
+        Commands::List { file, format, limit } => {
+            if let Err(e) = list_emails(file, format.as_ref(), *limit) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
