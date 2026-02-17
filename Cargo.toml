@@ -2,6 +2,9 @@
 name = "pstexplorer"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/stchris/pstexplorer"
+description = "A CLI tool to explore and extract data from Outlook PST files"
+homepage = "https://github.com/stchris/pstexplorer"
 
 [dependencies]
 outlook-pst = "1.1"
@@ -14,3 +17,8 @@ rtf-parser = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
