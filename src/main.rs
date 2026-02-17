@@ -1669,6 +1669,7 @@ mod tests {
     // ── legacy test (requires testdata/outlook.pst) ───────────────────────────
 
     #[test]
+    #[ignore = "requires testdata/outlook.pst which is not committed"]
     fn test_message_content_loads() {
         let (store, root) = open_test_store("testdata/outlook.pst");
         fn check_folder(store: &Rc<UnicodeStore>, folder: &UnicodeFolder, depth: usize) {
