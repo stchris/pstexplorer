@@ -213,9 +213,6 @@ enum Commands {
         /// Path to the PST file
         #[arg(required = true)]
         file: PathBuf,
-        /// Enable debug/diagnostic mode: logs events to pstexplorer-debug.log
-        #[arg(long)]
-        debug: bool,
     },
     /// Print statistics about a PST file
     Stats {
@@ -1545,8 +1542,6 @@ struct AppState {
     current_headers: MessageHeaders,
     active_pane: ActivePane,
     preview_scroll: u16,
-    /// Debug event log; None if debug mode not enabled.
-    debug_log: Option<Vec<String>>,
     /// Transient status bar message (cleared on next keypress).
     status_message: Option<String>,
     /// Current text in the search bar.
@@ -1568,7 +1563,7 @@ impl PstBrowser {
 }
 
 impl AppState {
-    fn new(browser: &PstBrowser, debug: bool) -> Self {
+    fn new(browser: &PstBrowser) -> Self {
         let mut all_messages: Vec<(String, u32)> = Vec::new();
         collect_all_messages(
             Rc::clone(&browser.store),
@@ -1602,7 +1597,6 @@ impl AppState {
             current_headers: MessageHeaders::default(),
             active_pane: ActivePane::Messages,
             preview_scroll: 0,
-            debug_log: if debug { Some(vec![]) } else { None },
             status_message: None,
             search_input: String::new(),
             search_bar_active: false,
@@ -1665,12 +1659,6 @@ impl AppState {
                     });
                 self.message_rows[i] = Some(row);
             }
-        }
-    }
-
-    fn log_event(&mut self, msg: &str) {
-        if let Some(log) = &mut self.debug_log {
-            log.push(msg.to_string());
         }
     }
 
@@ -1783,7 +1771,7 @@ impl AppState {
     }
 }
 
-fn browse_pst(file_path: &PathBuf, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn browse_pst(file_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     // Open the PST file
     let pst = UnicodePstFile::open(file_path)?;
     let pst_rc = Rc::new(pst);
@@ -1802,7 +1790,7 @@ fn browse_pst(file_path: &PathBuf, debug: bool) -> Result<(), Box<dyn std::error
             if execute!(stdout, EnterAlternateScreen).is_ok() {
                 let backend = CrosstermBackend::new(stdout);
                 if let Ok(mut terminal) = Terminal::new(backend) {
-                    let mut app_state = AppState::new(&browser, debug);
+                    let mut app_state = AppState::new(&browser);
 
                     // Main loop
                     while !app_state.exit {
@@ -1857,12 +1845,6 @@ fn browse_pst(file_path: &PathBuf, debug: bool) -> Result<(), Box<dyn std::error
                             eprintln!("Error handling events: {}", e);
                             break;
                         }
-                    }
-
-                    // Write debug log if enabled
-                    if let Some(log) = &app_state.debug_log {
-                        let content = log.join("\n") + "\n";
-                        let _ = std::fs::write("pstexplorer-debug.log", content);
                     }
 
                     // Cleanup
@@ -2123,27 +2105,6 @@ fn handle_events(
     {
         state.status_message = None;
 
-        let pane_name = match state.active_pane {
-            ActivePane::Messages => "Messages",
-            ActivePane::Preview => "Preview",
-        };
-        let key_str = match key.code {
-            KeyCode::Char(c) => format!("'{}'", c),
-            KeyCode::Enter => "Enter".to_string(),
-            KeyCode::Tab => "Tab".to_string(),
-            KeyCode::Esc => "Esc".to_string(),
-            KeyCode::Up => "Up".to_string(),
-            KeyCode::Down => "Down".to_string(),
-            _ => format!("{:?}", key.code),
-        };
-        state.log_event(&format!(
-            "[KEY] {} | pane={} msg_idx={:?} scroll={}",
-            key_str,
-            pane_name,
-            state.message_table_state.selected(),
-            state.preview_scroll
-        ));
-
         // --- Search bar input mode ---
         if state.search_bar_active {
             match key.code {
@@ -2256,8 +2217,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Browse { file, debug } => {
-            if let Err(e) = browse_pst(file, *debug) {
+        Commands::Browse { file } => {
+            if let Err(e) = browse_pst(file) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
