@@ -205,6 +205,9 @@ enum Commands {
         /// Path for the output SQLite database (default: <pst-name>.db)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Maximum number of messages to export (0 = no limit)
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
     },
 }
 
@@ -1047,6 +1050,7 @@ fn export_folder(
     path_prefix: &str,
     conn: &Connection,
     counts: &mut (usize, usize),
+    limit: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let folder_name = folder
         .properties()
@@ -1067,6 +1071,9 @@ fn export_folder(
 
     if let Some(contents_table) = folder.contents_table() {
         for row in contents_table.rows_matrix() {
+            if limit > 0 && counts.1 >= limit {
+                break;
+            }
             let row_id = u32::from(row.id());
             let entry_id = match store.properties().make_entry_id(NodeId::from(row_id)) {
                 Ok(id) => id,
@@ -1167,6 +1174,9 @@ fn export_folder(
 
     if let Some(hierarchy_table) = folder.hierarchy_table() {
         for row in hierarchy_table.rows_matrix() {
+            if limit > 0 && counts.1 >= limit {
+                break;
+            }
             let Ok(entry_id) = store
                 .properties()
                 .make_entry_id(NodeId::from(u32::from(row.id())))
@@ -1183,6 +1193,7 @@ fn export_folder(
                 &path,
                 conn,
                 counts,
+                limit,
             )?;
         }
     }
@@ -1193,6 +1204,7 @@ fn export_folder(
 fn export_pst(
     file_path: &PathBuf,
     output: Option<&PathBuf>,
+    limit: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db_path = match output {
         Some(p) => p.clone(),
@@ -1227,6 +1239,7 @@ fn export_pst(
         "",
         &conn,
         &mut counts,
+        limit,
     )?;
     conn.execute_batch("COMMIT;")?;
 
@@ -2153,8 +2166,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Export { file, output } => {
-            if let Err(e) = export_pst(file, output.as_ref()) {
+        Commands::Export { file, output, limit } => {
+            if let Err(e) = export_pst(file, output.as_ref(), *limit) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
