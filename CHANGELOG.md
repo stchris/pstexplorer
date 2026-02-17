@@ -42,5 +42,7 @@ All notable changes to this project will be documented in this file.
 - Add git-cliff
 - Initial changelog
 - Add license
+- Don't publish crate
+- Don't publish crate
 
 
