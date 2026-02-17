@@ -44,5 +44,6 @@ All notable changes to this project will be documented in this file.
 - Add license
 - Don't publish crate
 - Don't publish crate
+- Fix publish
 
 
