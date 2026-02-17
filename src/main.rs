@@ -1,5 +1,5 @@
+use chrono::{TimeZone, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -19,8 +19,8 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
-use chrono::{TimeZone, Utc};
 use rusqlite::{Connection, params};
+use serde::Serialize;
 use std::{io, path::PathBuf, rc::Rc, time::Instant};
 
 /// Convert a Windows FILETIME (100-ns ticks since 1601-01-01 UTC) to a
@@ -56,10 +56,30 @@ fn html_to_text(html: &str) -> String {
                 } else if !in_style && !in_script {
                     // Block-level tags → newline
                     let t = tag_lower.split_whitespace().next().unwrap_or("");
-                    if matches!(t, "br" | "br/" | "p" | "/p" | "div" | "/div"
-                        | "tr" | "/tr" | "li" | "/li" | "h1" | "h2" | "h3"
-                        | "h4" | "h5" | "h6" | "/h1" | "/h2" | "/h3"
-                        | "/h4" | "/h5" | "/h6") {
+                    if matches!(
+                        t,
+                        "br" | "br/"
+                            | "p"
+                            | "/p"
+                            | "div"
+                            | "/div"
+                            | "tr"
+                            | "/tr"
+                            | "li"
+                            | "/li"
+                            | "h1"
+                            | "h2"
+                            | "h3"
+                            | "h4"
+                            | "h5"
+                            | "h6"
+                            | "/h1"
+                            | "/h2"
+                            | "/h3"
+                            | "/h4"
+                            | "/h5"
+                            | "/h6"
+                    ) {
                         out.push('\n');
                     }
                 }
@@ -76,13 +96,15 @@ fn html_to_text(html: &str) -> String {
                 // Collect entity
                 let mut entity = String::new();
                 for ec in chars.by_ref() {
-                    if ec == ';' { break; }
+                    if ec == ';' {
+                        break;
+                    }
                     entity.push(ec);
                 }
                 match entity.as_str() {
-                    "amp"  => out.push('&'),
-                    "lt"   => out.push('<'),
-                    "gt"   => out.push('>'),
+                    "amp" => out.push('&'),
+                    "lt" => out.push('<'),
+                    "gt" => out.push('>'),
                     "quot" => out.push('"'),
                     "apos" => out.push('\''),
                     "nbsp" => out.push(' '),
@@ -96,13 +118,17 @@ fn html_to_text(html: &str) -> String {
                             out.push(n);
                         }
                     }
-                    _ => { out.push('&'); out.push_str(&entity); out.push(';'); }
+                    _ => {
+                        out.push('&');
+                        out.push_str(&entity);
+                        out.push(';');
+                    }
                 }
             } else if c == '\n' || c == '\r' || c == '\t' {
                 // Per HTML spec, whitespace in text nodes collapses to a single
                 // space. Only block-level tags (br, p, div…) produce newlines.
                 let last = out.chars().next_back();
-                if last.map_or(false, |ch| ch != ' ' && ch != '\n') {
+                if last.is_some_and(|ch| ch != ' ' && ch != '\n') {
                     out.push(' ');
                 }
             } else {
@@ -251,11 +277,7 @@ impl PstStats {
     }
 }
 
-fn collect_stats(
-    store: Rc<UnicodeStore>,
-    folder: &UnicodeFolder,
-    stats: &mut PstStats,
-) {
+fn collect_stats(store: Rc<UnicodeStore>, folder: &UnicodeFolder, stats: &mut PstStats) {
     stats.folder_count += 1;
 
     if let Some(contents_table) = folder.contents_table() {
@@ -288,9 +310,14 @@ fn collect_stats(
                 })
                 .unwrap_or_default();
 
-            if message_class.starts_with("IPM.NOTE") || message_class.is_empty() || message_class == "IPM" {
+            if message_class.starts_with("IPM.NOTE")
+                || message_class.is_empty()
+                || message_class == "IPM"
+            {
                 stats.email_count += 1;
-            } else if message_class.starts_with("IPM.APPOINTMENT") || message_class.starts_with("IPM.SCHEDULE") {
+            } else if message_class.starts_with("IPM.APPOINTMENT")
+                || message_class.starts_with("IPM.SCHEDULE")
+            {
                 stats.calendar_count += 1;
             } else if message_class.starts_with("IPM.CONTACT") {
                 stats.contact_count += 1;
@@ -304,11 +331,10 @@ fn collect_stats(
             }
 
             // PR_ATTACH_NUM (0x0E13) gives the count of attachments on this message
-            if let Some(PropertyValue::Integer32(n)) = props.get(0x0E13) {
-                if *n > 0 {
+            if let Some(PropertyValue::Integer32(n)) = props.get(0x0E13)
+                && *n > 0 {
                     stats.attachment_count += *n as usize;
                 }
-            }
 
             // Record timestamp: prefer PR_CLIENT_SUBMIT_TIME (0x0039), fall back to
             // PR_MESSAGE_DELIVERY_TIME (0x0E06)
@@ -465,8 +491,12 @@ fn list_emails(
             );
 
             let mut printed = 0usize;
-            let total_emails =
-                traverse_folder_hierarchy(Rc::clone(&store), &ipm_subtree_folder, limit, &mut printed)?;
+            let total_emails = traverse_folder_hierarchy(
+                Rc::clone(&store),
+                &ipm_subtree_folder,
+                limit,
+                &mut printed,
+            )?;
             println!("\nFound {} emails in the PST file", total_emails);
         }
     }
@@ -485,7 +515,7 @@ fn csv_escape(field: &str) -> String {
 
 /// Escape a field for TSV output (replace tabs and newlines with spaces).
 fn tsv_escape(field: &str) -> String {
-    field.replace('\t', " ").replace('\n', " ")
+    field.replace(['\t', '\n'], " ")
 }
 
 /// Recursively collect email records from the folder tree.
@@ -650,11 +680,8 @@ fn search_emails(
             }
         }
         None => {
-            let total = search_traverse_folders(
-                Rc::clone(&store),
-                &ipm_subtree_folder,
-                &query_lower,
-            )?;
+            let total =
+                search_traverse_folders(Rc::clone(&store), &ipm_subtree_folder, &query_lower)?;
             println!("\nFound {} matching emails", total);
         }
     }
@@ -676,16 +703,19 @@ fn collect_search_matches(
 
     if let Some(contents_table) = folder.contents_table() {
         for message_row in contents_table.rows_matrix() {
-            let message_entry_id = store
-                .properties()
-                .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
-                    message_row.id(),
-                )))?;
+            let message_entry_id =
+                store
+                    .properties()
+                    .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
+                        message_row.id(),
+                    )))?;
 
             if let Ok(message) = outlook_pst::messaging::message::UnicodeMessage::read(
                 store.clone(),
                 &message_entry_id,
-                Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0E06, 0x1000, 0x1013, 0x1009]),
+                Some(&[
+                    0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0E06, 0x1000, 0x1013, 0x1009,
+                ]),
             ) {
                 let props = message.properties();
 
@@ -750,11 +780,12 @@ fn collect_search_matches(
 
     if let Some(hierarchy_table) = folder.hierarchy_table() {
         for subfolder_row in hierarchy_table.rows_matrix() {
-            let subfolder_entry_id = store
-                .properties()
-                .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
-                    subfolder_row.id(),
-                )))?;
+            let subfolder_entry_id =
+                store
+                    .properties()
+                    .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
+                        subfolder_row.id(),
+                    )))?;
             let subfolder = outlook_pst::messaging::folder::UnicodeFolder::read(
                 store.clone(),
                 &subfolder_entry_id,
@@ -780,16 +811,19 @@ fn search_traverse_folders(
 
     if let Some(contents_table) = folder.contents_table() {
         for message_row in contents_table.rows_matrix() {
-            let message_entry_id = store
-                .properties()
-                .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
-                    message_row.id(),
-                )))?;
+            let message_entry_id =
+                store
+                    .properties()
+                    .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
+                        message_row.id(),
+                    )))?;
 
             if let Ok(message) = outlook_pst::messaging::message::UnicodeMessage::read(
                 store.clone(),
                 &message_entry_id,
-                Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0E06, 0x1000, 0x1013, 0x1009]),
+                Some(&[
+                    0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0E06, 0x1000, 0x1013, 0x1009,
+                ]),
             ) {
                 let props = message.properties();
 
@@ -856,11 +890,12 @@ fn search_traverse_folders(
 
     if let Some(hierarchy_table) = folder.hierarchy_table() {
         for subfolder_row in hierarchy_table.rows_matrix() {
-            let subfolder_entry_id = store
-                .properties()
-                .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
-                    subfolder_row.id(),
-                )))?;
+            let subfolder_entry_id =
+                store
+                    .properties()
+                    .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
+                        subfolder_row.id(),
+                    )))?;
             let subfolder = outlook_pst::messaging::folder::UnicodeFolder::read(
                 store.clone(),
                 &subfolder_entry_id,
@@ -898,10 +933,7 @@ fn collect_search_results(
     if let Some(contents_table) = folder.contents_table() {
         for message_row in contents_table.rows_matrix() {
             let row_id = u32::from(message_row.id());
-            let entry_id = match store
-                .properties()
-                .make_entry_id(NodeId::from(row_id))
-            {
+            let entry_id = match store.properties().make_entry_id(NodeId::from(row_id)) {
                 Ok(id) => id,
                 Err(_) => continue,
             };
@@ -909,7 +941,9 @@ fn collect_search_results(
             let message = match UnicodeMessage::read(
                 Rc::clone(&store),
                 &entry_id,
-                Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06, 0x1000, 0x1013, 0x1009]),
+                Some(&[
+                    0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06, 0x1000, 0x1013, 0x1009,
+                ]),
             ) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -964,7 +998,13 @@ fn collect_search_results(
                     .unwrap_or_default();
                 results.push(SearchResultItem {
                     folder_name: folder_name.clone(),
-                    row_data: MessageRow { from, to, cc, subject, date },
+                    row_data: MessageRow {
+                        from,
+                        to,
+                        cc,
+                        subject,
+                        date,
+                    },
                     row_id,
                 });
             }
@@ -1084,8 +1124,8 @@ fn export_folder(
                 Rc::clone(&store),
                 &entry_id,
                 Some(&[
-                    0x0037, 0x001A, 0x0039, 0x0C1A, 0x0E02, 0x0E04, 0x0E06, 0x0E13, 0x1000,
-                    0x1009, 0x1013,
+                    0x0037, 0x001A, 0x0039, 0x0C1A, 0x0E02, 0x0E04, 0x0E06, 0x0E13, 0x1000, 0x1009,
+                    0x1013,
                 ]),
             ) {
                 Ok(m) => m,
@@ -1429,11 +1469,36 @@ struct ColumnConfig {
 
 fn default_columns() -> Vec<ColumnConfig> {
     vec![
-        ColumnConfig { id: ColumnId::From,    label: "From",    width: Constraint::Percentage(20), visible: true },
-        ColumnConfig { id: ColumnId::To,      label: "To",      width: Constraint::Percentage(20), visible: true },
-        ColumnConfig { id: ColumnId::Cc,      label: "CC",      width: Constraint::Percentage(15), visible: false },
-        ColumnConfig { id: ColumnId::Subject, label: "Subject", width: Constraint::Percentage(40), visible: true },
-        ColumnConfig { id: ColumnId::Date,    label: "Date",    width: Constraint::Percentage(20), visible: true },
+        ColumnConfig {
+            id: ColumnId::From,
+            label: "From",
+            width: Constraint::Percentage(20),
+            visible: true,
+        },
+        ColumnConfig {
+            id: ColumnId::To,
+            label: "To",
+            width: Constraint::Percentage(20),
+            visible: true,
+        },
+        ColumnConfig {
+            id: ColumnId::Cc,
+            label: "CC",
+            width: Constraint::Percentage(15),
+            visible: false,
+        },
+        ColumnConfig {
+            id: ColumnId::Subject,
+            label: "Subject",
+            width: Constraint::Percentage(40),
+            visible: true,
+        },
+        ColumnConfig {
+            id: ColumnId::Date,
+            label: "Date",
+            width: Constraint::Percentage(20),
+            visible: true,
+        },
     ]
 }
 
@@ -1616,7 +1681,9 @@ impl AppState {
         self.search_mode = false;
         self.search_input.clear();
         self.message_table_state = TableState::default();
-        if n > 0 { self.message_table_state.select(Some(0)); }
+        if n > 0 {
+            self.message_table_state.select(Some(0));
+        }
         self.current_headers = MessageHeaders::default();
         self.current_message_content = "Select a message to view its content".to_string();
         self.preview_scroll = 0;
@@ -1634,17 +1701,20 @@ impl AppState {
                 UnicodeMessage::read(
                     Rc::clone(&browser.store),
                     &eid,
-                    Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06, 0x1000, 0x1013, 0x1009]),
-                ).ok()
+                    Some(&[
+                        0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06, 0x1000, 0x1013, 0x1009,
+                    ]),
+                )
+                .ok()
             });
             if message_result.is_none() {
                 self.current_message_content =
-                    "(This item type cannot be displayed — not a standard email message)".to_string();
+                    "(This item type cannot be displayed — not a standard email message)"
+                        .to_string();
                 self.current_headers = MessageHeaders::default();
                 self.preview_scroll = 0;
             }
-            if let Some(message) = message_result
-            {
+            if let Some(message) = message_result {
                 let props = message.properties();
 
                 let get_str = |id: u16| -> String {
@@ -1750,28 +1820,34 @@ fn browse_pst(file_path: &PathBuf, debug: bool) -> Result<(), Box<dyn std::error
                         if app_state.search_pending {
                             app_state.search_pending = false;
                             let results = run_search(&browser, &app_state.search_input);
-                            let elapsed = app_state.search_start
+                            let elapsed = app_state
+                                .search_start
                                 .take()
                                 .map(|t| t.elapsed().as_secs())
                                 .unwrap_or(0);
                             let n = results.len();
                             app_state.search_mode = true;
                             app_state.message_row_ids = results.iter().map(|r| r.row_id).collect();
-                            app_state.message_folder_names = results.iter().map(|r| r.folder_name.clone()).collect();
-                            app_state.message_rows = results.iter().map(|r| Some(r.row_data.clone())).collect();
+                            app_state.message_folder_names =
+                                results.iter().map(|r| r.folder_name.clone()).collect();
+                            app_state.message_rows =
+                                results.iter().map(|r| Some(r.row_data.clone())).collect();
                             app_state.message_table_state = TableState::default();
                             if n > 0 {
                                 app_state.message_table_state.select(Some(0));
                                 app_state.select_message(&browser, 0);
                             } else {
                                 app_state.current_headers = MessageHeaders::default();
-                                app_state.current_message_content = "No messages match the search query".to_string();
+                                app_state.current_message_content =
+                                    "No messages match the search query".to_string();
                             }
                             app_state.preview_scroll = 0;
                             app_state.active_pane = ActivePane::Messages;
                             app_state.status_message = Some(format!(
                                 "Found {} result{} ({}s)",
-                                n, if n == 1 { "" } else { "s" }, elapsed
+                                n,
+                                if n == 1 { "" } else { "s" },
+                                elapsed
                             ));
                             continue; // redraw immediately to show results
                         }
@@ -1856,13 +1932,19 @@ fn draw_ui(frame: &mut ratatui::Frame, _browser: &PstBrowser, state: &mut AppSta
 fn draw_search_bar(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let (label_style, input_style, cursor_style) = if state.search_bar_active {
         (
-            Style::default().fg(ratatui::style::Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(ratatui::style::Color::Cyan)
+                .add_modifier(Modifier::BOLD),
             Style::default().fg(ratatui::style::Color::White),
-            Style::default().fg(ratatui::style::Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(ratatui::style::Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )
     } else if state.search_mode {
         (
-            Style::default().fg(ratatui::style::Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(ratatui::style::Color::Yellow)
+                .add_modifier(Modifier::BOLD),
             Style::default().fg(ratatui::style::Color::White),
             Style::default(),
         )
@@ -1887,13 +1969,13 @@ fn draw_search_bar(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Style::default().fg(ratatui::style::Color::Yellow),
         ));
     } else if state.search_input.is_empty() {
-        spans.push(Span::styled("Press / to search", Style::default().fg(ratatui::style::Color::DarkGray)));
+        spans.push(Span::styled(
+            "Press / to search",
+            Style::default().fg(ratatui::style::Color::DarkGray),
+        ));
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
@@ -1901,7 +1983,11 @@ fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     state.message_list_height = area.height.saturating_sub(3) as usize;
 
     let count = state.message_row_ids.len();
-    let selected_num = state.message_table_state.selected().map(|i| i + 1).unwrap_or(0);
+    let selected_num = state
+        .message_table_state
+        .selected()
+        .map(|i| i + 1)
+        .unwrap_or(0);
     let title = if state.search_mode {
         format!("Search Results ({}/{})", selected_num, count)
     } else {
@@ -2051,7 +2137,10 @@ fn handle_events(
         };
         state.log_event(&format!(
             "[KEY] {} | pane={} msg_idx={:?} scroll={}",
-            key_str, pane_name, state.message_table_state.selected(), state.preview_scroll
+            key_str,
+            pane_name,
+            state.message_table_state.selected(),
+            state.preview_scroll
         ));
 
         // --- Search bar input mode ---
@@ -2072,8 +2161,12 @@ fn handle_events(
                         state.restore_all_messages();
                     }
                 }
-                KeyCode::Backspace => { state.search_input.pop(); }
-                KeyCode::Char(c) => { state.search_input.push(c); }
+                KeyCode::Backspace => {
+                    state.search_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    state.search_input.push(c);
+                }
                 _ => {}
             }
             return Ok(());
@@ -2142,13 +2235,21 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::List { file, format, limit } => {
+        Commands::List {
+            file,
+            format,
+            limit,
+        } => {
             if let Err(e) = list_emails(file, format.as_ref(), *limit) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
-        Commands::Search { file, query, format } => {
+        Commands::Search {
+            file,
+            query,
+            format,
+        } => {
             if let Err(e) = search_emails(file, query, format.as_ref()) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -2166,7 +2267,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Export { file, output, limit } => {
+        Commands::Export {
+            file,
+            output,
+            limit,
+        } => {
             if let Err(e) = export_pst(file, output.as_ref(), *limit) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -2186,14 +2291,6 @@ mod tests {
         let entry_id = store.properties().ipm_sub_tree_entry_id().unwrap();
         let root = UnicodeFolder::read(Rc::clone(&store), &entry_id).unwrap();
         (store, root)
-    }
-
-    fn prop_to_string(v: &PropertyValue) -> Option<String> {
-        match v {
-            PropertyValue::String8(s) => Some(s.to_string()),
-            PropertyValue::Unicode(s) => Some(s.to_string()),
-            _ => None,
-        }
     }
 
     // ── sample.pst tests ─────────────────────────────────────────────────────
@@ -2282,8 +2379,8 @@ mod tests {
             None
         }
 
-        let (subject, from, to) = find_message(&store, &root)
-            .expect("expected at least one message in sample.pst");
+        let (subject, from, to) =
+            find_message(&store, &root).expect("expected at least one message in sample.pst");
 
         assert!(
             subject.contains("Aspose.Email"),
@@ -2309,48 +2406,128 @@ mod tests {
         );
     }
 
-    // ── legacy test (requires testdata/outlook.pst) ───────────────────────────
+    // ── testPST.pst tests ────────────────────────────────────────────────────
 
+    /// Verify the folder structure: 2 folders in testPST.pst.
     #[test]
-    #[ignore = "requires testdata/outlook.pst which is not committed"]
-    fn test_message_content_loads() {
-        let (store, root) = open_test_store("testdata/outlook.pst");
-        fn check_folder(store: &Rc<UnicodeStore>, folder: &UnicodeFolder, depth: usize) {
-            let name = folder.properties().display_name().unwrap_or_default();
+    fn test_testpst_folder_count() {
+        let mut stats = PstStats::new();
+        let (store, root) = open_test_store("testdata/testPST.pst");
+        collect_stats(Rc::clone(&store), &root, &mut stats);
+        assert_eq!(stats.folder_count, 2);
+    }
+
+    /// Verify that exactly 6 emails exist in testPST.pst.
+    #[test]
+    fn test_testpst_email_count() {
+        let mut stats = PstStats::new();
+        let (store, root) = open_test_store("testdata/testPST.pst");
+        collect_stats(Rc::clone(&store), &root, &mut stats);
+        assert_eq!(stats.email_count, 6);
+        assert_eq!(stats.attachment_count, 0);
+    }
+
+    /// Verify that non-email artifact counts are all zero.
+    #[test]
+    fn test_testpst_no_other_artifacts() {
+        let mut stats = PstStats::new();
+        let (store, root) = open_test_store("testdata/testPST.pst");
+        collect_stats(Rc::clone(&store), &root, &mut stats);
+        assert_eq!(stats.calendar_count, 0);
+        assert_eq!(stats.contact_count, 0);
+        assert_eq!(stats.task_count, 0);
+        assert_eq!(stats.note_count, 0);
+    }
+
+    /// Verify subject and sender of the first message found in testPST.pst.
+    #[test]
+    fn test_testpst_message_fields() {
+        let (store, root) = open_test_store("testdata/testPST.pst");
+
+        fn find_message(
+            store: &Rc<UnicodeStore>,
+            folder: &UnicodeFolder,
+        ) -> Option<(String, String, String)> {
             if let Some(table) = folder.contents_table() {
                 for row in table.rows_matrix() {
-                    let entry_id = store.properties()
-                        .make_entry_id(NodeId::from(u32::from(row.id()))).unwrap();
-                    let props_filter = Some(&[0x0037u16, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06, 0x1000, 0x1013, 0x1009][..]);
-                    match UnicodeMessage::read(Rc::clone(store), &entry_id, props_filter) {
-                        Ok(msg) => {
-                            let props = msg.properties();
-                            let subj = props.get(0x0037).and_then(prop_to_string).unwrap_or("(none)".into());
-                            let body_plain = props.get(0x1000).and_then(prop_to_string);
-                            let body_html = props.get(0x1013).and_then(|v| match v {
-                                PropertyValue::Binary(b) => Some(String::from_utf8_lossy(b.buffer()).into_owned()),
-                                _ => prop_to_string(v),
-                            });
-                            eprintln!("{}{}/{}  plain={} html={}",
-                                "  ".repeat(depth), name, subj,
-                                body_plain.as_deref().map(|s| &s[..s.len().min(60)]).unwrap_or("NONE"),
-                                body_html.as_deref().map(|s| &s[..s.len().min(60)]).unwrap_or("NONE"));
-                        }
-                        Err(e) => eprintln!("{}{}  ERROR: {}", "  ".repeat(depth), name, e),
-                    }
+                    let entry_id = store
+                        .properties()
+                        .make_entry_id(NodeId::from(u32::from(row.id())))
+                        .ok()?;
+                    let msg = UnicodeMessage::read(
+                        Rc::clone(store),
+                        &entry_id,
+                        Some(&[0x0037, 0x0C1A, 0x0E04]),
+                    )
+                    .ok()?;
+                    let props = msg.properties();
+                    let get = |id: u16| -> String {
+                        props
+                            .get(id)
+                            .and_then(|v| match v {
+                                PropertyValue::String8(s) => Some(s.to_string()),
+                                PropertyValue::Unicode(s) => Some(s.to_string()),
+                                _ => None,
+                            })
+                            .unwrap_or_default()
+                    };
+                    return Some((get(0x0037), get(0x0C1A), get(0x0E04)));
                 }
             }
             if let Some(htable) = folder.hierarchy_table() {
                 for row in htable.rows_matrix() {
-                    let entry_id = store.properties()
-                        .make_entry_id(NodeId::from(u32::from(row.id()))).unwrap();
+                    let entry_id = store
+                        .properties()
+                        .make_entry_id(NodeId::from(u32::from(row.id())))
+                        .ok()?;
                     if let Ok(sub) = UnicodeFolder::read(Rc::clone(store), &entry_id) {
-                        check_folder(store, &sub, depth + 1);
+                        if let Some(result) = find_message(store, &sub) {
+                            return Some(result);
+                        }
                     }
                 }
             }
+            None
         }
-        check_folder(&store, &root, 0);
+
+        let (subject, from, _to) =
+            find_message(&store, &root).expect("expected at least one message in testPST.pst");
+
+        assert!(
+            subject.contains("Feature Generators"),
+            "unexpected subject: {subject:?}"
+        );
+        assert_eq!(from, "Jörn Kottmann");
+    }
+
+    /// Verify that testPST.pst has timestamps within the expected range.
+    #[test]
+    fn test_testpst_has_timestamps() {
+        let mut stats = PstStats::new();
+        let (store, root) = open_test_store("testdata/testPST.pst");
+        collect_stats(Rc::clone(&store), &root, &mut stats);
+        assert!(
+            stats.earliest_ts.is_some(),
+            "expected timestamps in testPST.pst"
+        );
+        assert!(
+            stats.latest_ts.is_some(),
+            "expected timestamps in testPST.pst"
+        );
+        let earliest = stats.earliest_ts.unwrap();
+        let latest = stats.latest_ts.unwrap();
+        assert!(earliest < latest, "earliest should be before latest");
+        // Verify the formatted dates match expected values
+        assert_eq!(
+            &filetime_to_string(earliest)[..10],
+            "2014-02-24",
+            "unexpected earliest date"
+        );
+        assert_eq!(
+            &filetime_to_string(latest)[..10],
+            "2014-02-26",
+            "unexpected latest date"
+        );
     }
 
     // ── export tests ──────────────────────────────────────────────────────────
@@ -2384,11 +2561,9 @@ mod tests {
 
         // Verify the message has the expected subject and sender
         let (subject, sender): (String, String) = conn
-            .query_row(
-                "SELECT subject, sender FROM messages LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT subject, sender FROM messages LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert!(
             subject.contains("Aspose.Email"),
@@ -2444,8 +2619,102 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
 
         let limit: usize = 1;
+        export_pst(&PathBuf::from("testdata/sample.pst"), Some(&db_path), limit)
+            .expect("export should succeed");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let msg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            msg_count <= limit as i64,
+            "exported {msg_count} messages but limit was {limit}"
+        );
+        assert_eq!(msg_count, 1, "expected exactly 1 message with limit=1");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // ── testPST.pst export tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_export_testpst() {
+        let db_path = std::env::temp_dir().join("pstexplorer_test_export_testpst.db");
+        let _ = std::fs::remove_file(&db_path);
+
         export_pst(
-            &PathBuf::from("testdata/sample.pst"),
+            &PathBuf::from("testdata/testPST.pst"),
+            Some(&db_path),
+            0, // no limit
+        )
+        .expect("export should succeed");
+
+        let conn = Connection::open(&db_path).unwrap();
+
+        // Verify folder count
+        let folder_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM folders", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(folder_count, 2);
+
+        // Verify message count
+        let msg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg_count, 6);
+
+        // Verify a known message exists
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE subject LIKE '%Feature Generators%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(count >= 1, "expected at least one 'Feature Generators' message");
+
+        // Verify folder paths are populated
+        let root_path: String = conn
+            .query_row(
+                "SELECT path FROM folders WHERE parent_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!root_path.is_empty());
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_export_testpst_limit_zero_exports_all() {
+        let db_path = std::env::temp_dir().join("pstexplorer_test_export_testpst_limit0.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        export_pst(
+            &PathBuf::from("testdata/testPST.pst"),
+            Some(&db_path),
+            0, // 0 = unlimited
+        )
+        .expect("export should succeed");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let msg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg_count, 6, "limit=0 should export all 6 messages");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_export_testpst_limit_caps_message_count() {
+        let db_path = std::env::temp_dir().join("pstexplorer_test_export_testpst_limit3.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        let limit: usize = 3;
+        export_pst(
+            &PathBuf::from("testdata/testPST.pst"),
             Some(&db_path),
             limit,
         )
@@ -2459,7 +2728,7 @@ mod tests {
             msg_count <= limit as i64,
             "exported {msg_count} messages but limit was {limit}"
         );
-        assert_eq!(msg_count, 1, "expected exactly 1 message with limit=1");
+        assert_eq!(msg_count, 3, "expected exactly 3 messages with limit=3");
 
         let _ = std::fs::remove_file(&db_path);
     }
