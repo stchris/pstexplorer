@@ -20,6 +20,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 use chrono::{TimeZone, Utc};
+use rusqlite::{Connection, params};
 use std::{io, path::PathBuf, rc::Rc, time::Instant};
 
 /// Convert a Windows FILETIME (100-ns ticks since 1601-01-01 UTC) to a
@@ -192,6 +193,15 @@ enum Commands {
         /// Path to the PST file
         #[arg(required = true)]
         file: PathBuf,
+    },
+    /// Export a PST file to a SQLite database
+    Export {
+        /// Path to the PST file
+        #[arg(required = true)]
+        file: PathBuf,
+        /// Path for the output SQLite database (default: <pst-name>.db)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -960,6 +970,258 @@ fn collect_search_results(
             collect_search_results(Rc::clone(&store), &subfolder, query_lower, results);
         }
     }
+}
+
+// ── SQLite Export ────────────────────────────────────────────────────────
+
+fn create_export_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE folders (
+            id        INTEGER PRIMARY KEY,
+            parent_id INTEGER REFERENCES folders(id),
+            name      TEXT NOT NULL,
+            path      TEXT NOT NULL
+        );
+
+        CREATE TABLE messages (
+            id               INTEGER PRIMARY KEY,
+            folder_id        INTEGER NOT NULL REFERENCES folders(id),
+            message_class    TEXT NOT NULL,
+            subject          TEXT,
+            sender           TEXT,
+            to_recipients    TEXT,
+            cc_recipients    TEXT,
+            submit_time      TEXT,
+            delivery_time    TEXT,
+            body_text        TEXT,
+            body_html        TEXT,
+            body_rtf         BLOB,
+            attachment_count INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE attachments (
+            id           INTEGER PRIMARY KEY,
+            message_id   INTEGER NOT NULL REFERENCES messages(id),
+            filename     TEXT,
+            content_type TEXT,
+            size         INTEGER,
+            data         BLOB
+        );
+
+        CREATE INDEX idx_messages_folder ON messages(folder_id);
+        CREATE INDEX idx_messages_class  ON messages(message_class);
+        CREATE INDEX idx_messages_sender ON messages(sender);
+        CREATE INDEX idx_messages_submit ON messages(submit_time);
+        CREATE INDEX idx_attachments_msg ON attachments(message_id);
+        ",
+    )
+}
+
+fn filetime_to_iso(ticks: i64) -> Option<String> {
+    const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
+    let secs = ticks / 10_000_000 - EPOCH_DIFF_SECS;
+    let nanos = ((ticks % 10_000_000) * 100) as u32;
+    match Utc.timestamp_opt(secs, nanos) {
+        chrono::LocalResult::Single(dt) => Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        _ => None,
+    }
+}
+
+fn export_folder(
+    store: Rc<UnicodeStore>,
+    folder: &UnicodeFolder,
+    parent_folder_id: Option<i64>,
+    path_prefix: &str,
+    conn: &Connection,
+    counts: &mut (usize, usize),
+) -> Result<(), Box<dyn std::error::Error>> {
+    let folder_name = folder
+        .properties()
+        .display_name()
+        .unwrap_or_else(|_| "Unknown".to_string());
+    let path = if path_prefix.is_empty() {
+        folder_name.clone()
+    } else {
+        format!("{}/{}", path_prefix, folder_name)
+    };
+
+    conn.execute(
+        "INSERT INTO folders (parent_id, name, path) VALUES (?1, ?2, ?3)",
+        params![parent_folder_id, &folder_name, &path],
+    )?;
+    let folder_id = conn.last_insert_rowid();
+    counts.0 += 1;
+
+    if let Some(contents_table) = folder.contents_table() {
+        for row in contents_table.rows_matrix() {
+            let row_id = u32::from(row.id());
+            let entry_id = match store.properties().make_entry_id(NodeId::from(row_id)) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            let message = match UnicodeMessage::read(
+                Rc::clone(&store),
+                &entry_id,
+                Some(&[
+                    0x0037, 0x001A, 0x0039, 0x0C1A, 0x0E02, 0x0E04, 0x0E06, 0x0E13, 0x1000,
+                    0x1009, 0x1013,
+                ]),
+            ) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let props = message.properties();
+
+            let get_str = |id: u16| -> Option<String> {
+                props.get(id).and_then(|v| match v {
+                    PropertyValue::String8(s) => Some(s.to_string()),
+                    PropertyValue::Unicode(s) => Some(s.to_string()),
+                    _ => None,
+                })
+            };
+
+            let message_class = get_str(0x001A)
+                .map(|s| s.to_ascii_uppercase())
+                .unwrap_or_else(|| "IPM.NOTE".to_string());
+            let subject = get_str(0x0037);
+            let sender = get_str(0x0C1A);
+            let to_recipients = get_str(0x0E04);
+            let cc_recipients = get_str(0x0E02);
+
+            let submit_time = props.get(0x0039).and_then(|v| match v {
+                PropertyValue::Time(t) => filetime_to_iso(*t),
+                _ => None,
+            });
+            let delivery_time = props.get(0x0E06).and_then(|v| match v {
+                PropertyValue::Time(t) => filetime_to_iso(*t),
+                _ => None,
+            });
+
+            let body_text = get_str(0x1000);
+
+            let body_html: Option<String> = props.get(0x1013).and_then(|v| match v {
+                PropertyValue::Binary(b) => {
+                    let s = String::from_utf8_lossy(b.buffer());
+                    if s.trim_start().starts_with('<') {
+                        Some(s.into_owned())
+                    } else {
+                        None
+                    }
+                }
+                PropertyValue::String8(s) => Some(s.to_string()),
+                PropertyValue::Unicode(s) => Some(s.to_string()),
+                _ => None,
+            });
+
+            let body_rtf: Option<Vec<u8>> = props.get(0x1009).and_then(|v| match v {
+                PropertyValue::Binary(b) => Some(b.buffer().to_vec()),
+                _ => None,
+            });
+
+            let attachment_count: i32 = props
+                .get(0x0E13)
+                .and_then(|v| match v {
+                    PropertyValue::Integer32(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0);
+
+            conn.execute(
+                "INSERT INTO messages (folder_id, message_class, subject, sender,
+                    to_recipients, cc_recipients, submit_time, delivery_time,
+                    body_text, body_html, body_rtf, attachment_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    folder_id,
+                    &message_class,
+                    &subject,
+                    &sender,
+                    &to_recipients,
+                    &cc_recipients,
+                    &submit_time,
+                    &delivery_time,
+                    &body_text,
+                    &body_html,
+                    &body_rtf,
+                    attachment_count,
+                ],
+            )?;
+            counts.1 += 1;
+        }
+    }
+
+    if let Some(hierarchy_table) = folder.hierarchy_table() {
+        for row in hierarchy_table.rows_matrix() {
+            let Ok(entry_id) = store
+                .properties()
+                .make_entry_id(NodeId::from(u32::from(row.id())))
+            else {
+                continue;
+            };
+            let Ok(subfolder) = UnicodeFolder::read(Rc::clone(&store), &entry_id) else {
+                continue;
+            };
+            export_folder(
+                Rc::clone(&store),
+                &subfolder,
+                Some(folder_id),
+                &path,
+                conn,
+                counts,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn export_pst(
+    file_path: &PathBuf,
+    output: Option<&PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db_path = match output {
+        Some(p) => p.clone(),
+        None => {
+            let stem = file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("export");
+            PathBuf::from(format!("{}.db", stem))
+        }
+    };
+
+    if db_path.exists() {
+        return Err(format!("Output file already exists: {:?}", db_path).into());
+    }
+
+    let pst = UnicodePstFile::open(file_path)?;
+    let store = Rc::new(UnicodeStore::read(Rc::new(pst))?);
+    let ipm_sub_tree_entry_id = store.properties().ipm_sub_tree_entry_id()?;
+    let ipm_subtree_folder = UnicodeFolder::read(Rc::clone(&store), &ipm_sub_tree_entry_id)?;
+
+    let conn = Connection::open(&db_path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    create_export_schema(&conn)?;
+
+    let mut counts: (usize, usize) = (0, 0);
+    conn.execute_batch("BEGIN TRANSACTION;")?;
+    export_folder(
+        Rc::clone(&store),
+        &ipm_subtree_folder,
+        None,
+        "",
+        &conn,
+        &mut counts,
+    )?;
+    conn.execute_batch("COMMIT;")?;
+
+    println!("Exported to {:?}", db_path);
+    println!("  Folders:  {}", counts.0);
+    println!("  Messages: {}", counts.1);
+    Ok(())
 }
 
 fn collect_all_messages(
@@ -1868,6 +2130,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Export { file, output } => {
+            if let Err(e) = export_pst(file, output.as_ref()) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -2047,5 +2315,61 @@ mod tests {
             }
         }
         check_folder(&store, &root, 0);
+    }
+
+    // ── export tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_export_sample_pst() {
+        let db_path = std::env::temp_dir().join("pstexplorer_test_export.db");
+        // Clean up from any previous run
+        let _ = std::fs::remove_file(&db_path);
+
+        export_pst(
+            &PathBuf::from("testdata/sample.pst"),
+            Some(&db_path),
+        )
+        .expect("export should succeed");
+
+        let conn = Connection::open(&db_path).unwrap();
+
+        // Verify folder count
+        let folder_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM folders", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(folder_count, 5);
+
+        // Verify message count
+        let msg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg_count, 1);
+
+        // Verify the message has the expected subject and sender
+        let (subject, sender): (String, String) = conn
+            .query_row(
+                "SELECT subject, sender FROM messages LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            subject.contains("Aspose.Email"),
+            "unexpected subject: {subject:?}"
+        );
+        assert_eq!(sender, "Sender Name");
+
+        // Verify folder paths are populated
+        let root_path: String = conn
+            .query_row(
+                "SELECT path FROM folders WHERE parent_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!root_path.is_empty());
+
+        // Clean up
+        let _ = std::fs::remove_file(&db_path);
     }
 }
