@@ -40,3 +40,5 @@ Export folders and messages to a SQLite database for further analysis. Use `--ou
 ### browse
 
 Interactive terminal UI for navigating folders and reading messages.
+
+![A screen showing the TUI for the browse command](./screenshot-browse.png)
