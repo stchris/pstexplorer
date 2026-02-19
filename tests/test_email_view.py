@@ -18,7 +18,7 @@ import time
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(ROOT, "testPST.db")
+DB_PATH = os.path.join(ROOT, "testdata/testPST.db")
 PLUGINS_DIR = os.path.join(ROOT, "plugins")
 
 
@@ -34,10 +34,15 @@ def datasette_url():
     port = _free_port()
     proc = subprocess.Popen(
         [
-            sys.executable, "-m", "datasette", "serve",
+            sys.executable,
+            "-m",
+            "datasette",
+            "serve",
             DB_PATH,
-            "--plugins-dir", PLUGINS_DIR,
-            "--port", str(port),
+            "--plugins-dir",
+            PLUGINS_DIR,
+            "--port",
+            str(port),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -56,7 +61,9 @@ def datasette_url():
     else:
         proc.kill()
         out, err = proc.communicate()
-        pytest.fail(f"datasette failed to start:\nstdout={out.decode()}\nstderr={err.decode()}")
+        pytest.fail(
+            f"datasette failed to start:\nstdout={out.decode()}\nstderr={err.decode()}"
+        )
 
     yield base
 
@@ -67,6 +74,7 @@ def datasette_url():
 # ---------------------------------------------------------------------------
 # Table view
 # ---------------------------------------------------------------------------
+
 
 class TestTableView:
     """Tests for /testPST/messages (the table listing)."""
@@ -83,15 +91,19 @@ class TestTableView:
         page.wait_for_load_state("networkidle")
         td = page.query_selector("td.col-body_text")
         assert td is not None
-        ws = page.evaluate(
-            "el => window.getComputedStyle(el).whiteSpace", td
-        )
+        ws = page.evaluate("el => window.getComputedStyle(el).whiteSpace", td)
         assert ws == "pre-wrap"
 
     def test_noisy_columns_hidden(self, page, datasette_url):
         page.goto(f"{datasette_url}/testPST/messages")
         page.wait_for_load_state("networkidle")
-        for col in ["body_html", "body_rtf", "folder_id", "message_class", "delivery_time"]:
+        for col in [
+            "body_html",
+            "body_rtf",
+            "folder_id",
+            "message_class",
+            "delivery_time",
+        ]:
             th = page.query_selector(f"th.col-{col}")
             assert th is not None, f"th.col-{col} missing from DOM"
             assert not th.is_visible(), f"th.col-{col} should be hidden"
@@ -115,6 +127,7 @@ class TestTableView:
 # Row (detail) view
 # ---------------------------------------------------------------------------
 
+
 class TestRowView:
     """Tests for /testPST/messages/<id> (the single-message email view)."""
 
@@ -134,9 +147,7 @@ class TestRowView:
         assert viewer.is_visible()
 
         table = page.query_selector("table.rows-and-columns")
-        display = page.evaluate(
-            "el => window.getComputedStyle(el).display", table
-        )
+        display = page.evaluate("el => window.getComputedStyle(el).display", table)
         assert display == "none", "raw table should be hidden"
 
     def test_envelope_shows_correct_fields(self, page, datasette_url):
@@ -147,7 +158,7 @@ class TestRowView:
         assert "Re: Feature Generators" in subject
 
         labels = page.query_selector_all(".email-field-label")
-        label_texts = [l.text_content().strip() for l in labels]
+        label_texts = [label.text_content().strip() for label in labels]
         assert "From" in label_texts
         assert "To" in label_texts
         assert "Date" in label_texts
@@ -163,7 +174,7 @@ class TestRowView:
         page.wait_for_load_state("networkidle")
 
         labels = page.query_selector_all(".email-field-label")
-        label_texts = [l.text_content().strip() for l in labels]
+        label_texts = [label.text_content().strip() for label in labels]
         assert "CC" not in label_texts
 
     def test_body_text_shown(self, page, datasette_url):
@@ -178,6 +189,7 @@ class TestRowView:
 # ---------------------------------------------------------------------------
 # Navigation (prev / next)
 # ---------------------------------------------------------------------------
+
 
 class TestNavigation:
     """Tests for the prev/next links on the row view."""
@@ -253,6 +265,7 @@ class TestNavigation:
 # ---------------------------------------------------------------------------
 # Non-messages tables should be unaffected
 # ---------------------------------------------------------------------------
+
 
 class TestOtherTables:
     """The plugin must not inject anything on non-messages tables."""
