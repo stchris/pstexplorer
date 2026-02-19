@@ -1,0 +1,13 @@
+[project]
+name = "pstexplorer-ner"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "compressed-rtf>=1.0.7",
+  "pip>=26.0.1",
+  "pydantic<2",
+  "spacy>=3.8.11",
+  "striprtf>=0.0.29",
+]
