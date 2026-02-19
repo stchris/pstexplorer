@@ -94,3 +94,5 @@ Run the playwright-driven integration test for this datasette plugin with:
 ```
 uv run --with datasette --with pytest --with pytest-playwright pytest
 ```
+
+![A browser screen showing the datasette plugin that allows e-mails to be read and navigated](./screenshot-datasette-plugin.png)
