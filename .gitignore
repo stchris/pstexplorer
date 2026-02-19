@@ -1,3 +1,9 @@
 /target
 
 .claude
+
+*.db
+*.db-shm
+*.db-wal
+
+**/*.pyc

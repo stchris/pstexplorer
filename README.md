@@ -72,8 +72,25 @@ Export folders and messages to a SQLite database for further analysis. Use `--ou
 > [!TIP]
 > export to a SQLite db and then use `uvx datasette` to visually browse the data
 
+
 ### browse
 
 Interactive terminal UI for navigating folders and reading messages.
 
 ![A screen showing the TUI for the browse command](./screenshot-browse.png)
+
+# Datasette plugin
+
+The `plugins/` folder includes a [Datasette](https://datasette.io/) plugin which makes browsing emails a bit easier, by providing detail views with next/prev buttons and a layout which separates header data. 
+
+After exporting an SQLite db with `pstexplorer export my.pst` run:
+
+```
+uvx datasette serve my.db --plugins-dir plugins/
+```
+
+Run the playwright-driven integration test for this datasette plugin with:
+
+```
+uv run --with datasette --with pytest --with pytest-playwright pytest
+```
