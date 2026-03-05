@@ -23,6 +23,9 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::{io, path::PathBuf, rc::Rc, time::Instant};
 
+#[allow(deprecated)]
+use ftm_types::generated::entities::{Email as FtmEmail, Folder as FtmFolder};
+
 /// Convert a Windows FILETIME (100-ns ticks since 1601-01-01 UTC) to a
 /// human-readable UTC string, e.g. "2010-11-24 15:24:27 UTC".
 /// Decompress PR_RTF_COMPRESSED bytes and extract plain text.
@@ -172,6 +175,7 @@ enum OutputFormat {
     Csv,
     Tsv,
     Json,
+    Ftm,
 }
 
 #[derive(Parser)]
@@ -189,7 +193,7 @@ enum Commands {
         /// Path to the PST file
         #[arg(required = true)]
         file: PathBuf,
-        /// Output format (csv, tsv, or json). Omit for human-readable output.
+        /// Output format (csv, tsv, json, or ftm). Omit for human-readable output.
         #[arg(long)]
         format: Option<OutputFormat>,
         /// Maximum number of entries to output (0 = no limit)
@@ -204,7 +208,7 @@ enum Commands {
         /// Search query (case-insensitive, matched against from, to, cc, and body)
         #[arg(required = true)]
         query: String,
-        /// Output format (csv, tsv, or json). Omit for human-readable output.
+        /// Output format (csv, tsv, json, or ftm). Omit for human-readable output.
         #[arg(long)]
         format: Option<OutputFormat>,
     },
@@ -415,7 +419,13 @@ struct EmailRecord {
     folder: String,
     subject: String,
     from: String,
+    to: String,
+    cc: String,
     date: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_html: Option<String>,
 }
 
 fn list_emails(
@@ -436,9 +446,15 @@ fn list_emails(
 
     match format {
         Some(fmt) => {
+            let include_body = matches!(fmt, OutputFormat::Ftm);
             // Collect all emails then output in the requested format
             let mut records: Vec<EmailRecord> = Vec::new();
-            collect_emails(Rc::clone(&store), &ipm_subtree_folder, &mut records)?;
+            collect_emails(
+                Rc::clone(&store),
+                &ipm_subtree_folder,
+                &mut records,
+                include_body,
+            )?;
 
             // Apply limit if set
             let records: Vec<EmailRecord> = if limit > 0 {
@@ -452,28 +468,35 @@ fn list_emails(
                     println!("{}", serde_json::to_string_pretty(&records)?);
                 }
                 OutputFormat::Csv => {
-                    println!("folder,subject,from,date");
+                    println!("folder,subject,from,to,cc,date");
                     for r in &records {
                         println!(
-                            "{},{},{},{}",
+                            "{},{},{},{},{},{}",
                             csv_escape(&r.folder),
                             csv_escape(&r.subject),
                             csv_escape(&r.from),
+                            csv_escape(&r.to),
+                            csv_escape(&r.cc),
                             csv_escape(&r.date),
                         );
                     }
                 }
                 OutputFormat::Tsv => {
-                    println!("folder\tsubject\tfrom\tdate");
+                    println!("folder\tsubject\tfrom\tto\tcc\tdate");
                     for r in &records {
                         println!(
-                            "{}\t{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}\t{}\t{}",
                             tsv_escape(&r.folder),
                             tsv_escape(&r.subject),
                             tsv_escape(&r.from),
+                            tsv_escape(&r.to),
+                            tsv_escape(&r.cc),
                             tsv_escape(&r.date),
                         );
                     }
+                }
+                OutputFormat::Ftm => {
+                    emit_ftm_entities(&records)?;
                 }
             }
         }
@@ -521,6 +544,7 @@ fn collect_emails(
     store: Rc<UnicodeStore>,
     folder: &outlook_pst::messaging::folder::UnicodeFolder,
     records: &mut Vec<EmailRecord>,
+    include_body: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let folder_name = folder
         .properties()
@@ -536,54 +560,73 @@ fn collect_emails(
                         message_row.id(),
                     )))?;
 
+            let mut prop_ids = vec![0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06];
+            if include_body {
+                prop_ids.extend_from_slice(&[0x1000, 0x1013]);
+            }
+
             if let Ok(message) = outlook_pst::messaging::message::UnicodeMessage::read(
                 store.clone(),
                 &message_entry_id,
-                Some(&[0x0037, 0x0C1A, 0x0E06]),
+                Some(&prop_ids),
             ) {
-                let properties = message.properties();
+                let props = message.properties();
 
-                let subject = properties
-                    .get(0x0037)
+                let get_str = |id: u16| -> String {
+                    props
+                        .get(id)
+                        .and_then(|v| match v {
+                            PropertyValue::String8(s) => Some(s.to_string()),
+                            PropertyValue::Unicode(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                        .unwrap_or_default()
+                };
+
+                let subject = get_str(0x0037);
+                let from = get_str(0x0C1A);
+                let to = get_str(0x0E04);
+                let cc = get_str(0x0E02);
+
+                let date = props
+                    .get(0x0039)
+                    .or_else(|| props.get(0x0E06))
                     .and_then(|v| match v {
-                        outlook_pst::ltp::prop_context::PropertyValue::String8(s) => {
-                            Some(s.to_string())
-                        }
-                        outlook_pst::ltp::prop_context::PropertyValue::Unicode(s) => {
-                            Some(s.to_string())
-                        }
+                        PropertyValue::Time(t) => Some(filetime_to_iso(*t)),
                         _ => None,
                     })
-                    .unwrap_or_else(|| "No Subject".to_string());
+                    .flatten()
+                    .unwrap_or_default();
 
-                let sender = properties
-                    .get(0x0C1A)
-                    .and_then(|v| match v {
-                        outlook_pst::ltp::prop_context::PropertyValue::String8(s) => {
-                            Some(s.to_string())
-                        }
-                        outlook_pst::ltp::prop_context::PropertyValue::Unicode(s) => {
-                            Some(s.to_string())
-                        }
+                let (body_text, body_html) = if include_body {
+                    let get_str_opt = |id: u16| -> Option<String> {
+                        props.get(id).and_then(|v| match v {
+                            PropertyValue::String8(s) => Some(s.to_string()),
+                            PropertyValue::Unicode(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                    };
+                    let bt = get_str_opt(0x1000);
+                    let bh = props.get(0x1013).and_then(|v| match v {
+                        PropertyValue::Binary(b) => Some(String::from_utf8_lossy(b.buffer()).into_owned()),
+                        PropertyValue::String8(s) => Some(s.to_string()),
+                        PropertyValue::Unicode(s) => Some(s.to_string()),
                         _ => None,
-                    })
-                    .unwrap_or_else(|| "Unknown Sender".to_string());
-
-                let received_time = properties
-                    .get(0x0E06)
-                    .and_then(|v| match v {
-                        outlook_pst::ltp::prop_context::PropertyValue::Time(t) => {
-                            Some(t.to_string())
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "Unknown Date".to_string());
+                    });
+                    (bt, bh)
+                } else {
+                    (None, None)
+                };
 
                 records.push(EmailRecord {
                     folder: folder_name.clone(),
                     subject,
-                    from: sender,
-                    date: received_time,
+                    from,
+                    to,
+                    cc,
+                    date,
+                    body_text,
+                    body_html,
                 });
             }
         }
@@ -601,22 +644,91 @@ fn collect_emails(
                 store.clone(),
                 &subfolder_entry_id,
             )?;
-            collect_emails(store.clone(), &subfolder, records)?;
+            collect_emails(store.clone(), &subfolder, records, include_body)?;
         }
     }
 
     Ok(())
 }
 
-/// A single search result record for structured output.
-#[derive(Serialize)]
-struct SearchRecord {
-    folder: String,
-    subject: String,
-    from: String,
-    to: String,
-    cc: String,
-    date: String,
+/// Generate a deterministic FTM folder ID from folder name.
+fn ftm_folder_id(folder_name: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    "folder".hash(&mut hasher);
+    folder_name.hash(&mut hasher);
+    format!("pst-folder-{:016x}", hasher.finish())
+}
+
+/// Create an FTM `Folder` entity from a folder name.
+#[allow(deprecated)]
+fn folder_to_ftm(folder_name: &str) -> FtmFolder {
+    let mut entity = FtmFolder::new(ftm_folder_id(folder_name));
+    entity.name = vec![folder_name.to_string()];
+    entity
+}
+
+/// Convert an `EmailRecord` to an FTM `Email` entity.
+#[allow(deprecated)]
+fn email_record_to_ftm(r: &EmailRecord) -> FtmEmail {
+    let opt_vec = |s: &str| -> Option<Vec<String>> {
+        if s.is_empty() {
+            None
+        } else {
+            Some(vec![s.to_string()])
+        }
+    };
+
+    // Generate a deterministic ID from subject+from+date+folder
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    r.subject.hash(&mut hasher);
+    r.from.hash(&mut hasher);
+    r.date.hash(&mut hasher);
+    r.folder.hash(&mut hasher);
+
+    let mut entity = FtmEmail::new(format!("pst-{:016x}", hasher.finish()));
+
+    entity.subject = opt_vec(&r.subject);
+    entity.from = opt_vec(&r.from);
+    entity.to = opt_vec(&r.to);
+    entity.cc = opt_vec(&r.cc);
+    entity.date = opt_vec(&r.date);
+    entity.parent = Some(vec![ftm_folder_id(&r.folder)]);
+    entity.body_text = r.body_text.as_deref().and_then(|s| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(vec![s.to_string()])
+        }
+    });
+    entity.body_html = r.body_html.as_deref().and_then(|s| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(vec![s.to_string()])
+        }
+    });
+
+    entity
+}
+
+/// Emit FTM JSONL: first unique Folder entities, then Email entities.
+fn emit_ftm_entities(records: &[EmailRecord]) -> Result<(), Box<dyn std::error::Error>> {
+    // Collect and emit unique folders first
+    let mut seen_folders = std::collections::HashSet::new();
+    for r in records {
+        if seen_folders.insert(r.folder.clone()) {
+            let folder = folder_to_ftm(&r.folder);
+            println!("{}", folder.to_ftm_json()?);
+        }
+    }
+    // Emit email entities
+    for r in records {
+        let entity = email_record_to_ftm(r);
+        println!("{}", entity.to_ftm_json()?);
+    }
+    Ok(())
 }
 
 fn search_emails(
@@ -635,12 +747,14 @@ fn search_emails(
 
     match format {
         Some(fmt) => {
-            let mut records: Vec<SearchRecord> = Vec::new();
+            let include_body = matches!(fmt, OutputFormat::Ftm);
+            let mut records: Vec<EmailRecord> = Vec::new();
             collect_search_matches(
                 Rc::clone(&store),
                 &ipm_subtree_folder,
                 &query_lower,
                 &mut records,
+                include_body,
             )?;
 
             match fmt {
@@ -675,6 +789,9 @@ fn search_emails(
                         );
                     }
                 }
+                OutputFormat::Ftm => {
+                    emit_ftm_entities(&records)?;
+                }
             }
         }
         None => {
@@ -692,7 +809,8 @@ fn collect_search_matches(
     store: Rc<UnicodeStore>,
     folder: &outlook_pst::messaging::folder::UnicodeFolder,
     query_lower: &str,
-    records: &mut Vec<SearchRecord>,
+    records: &mut Vec<EmailRecord>,
+    include_body: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let folder_name = folder
         .properties()
@@ -712,7 +830,7 @@ fn collect_search_matches(
                 store.clone(),
                 &message_entry_id,
                 Some(&[
-                    0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0E06, 0x1000, 0x1013, 0x1009,
+                    0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06, 0x1000, 0x1013, 0x1009,
                 ]),
             ) {
                 let props = message.properties();
@@ -756,20 +874,39 @@ fn collect_search_matches(
 
                 if matches {
                     let date = props
-                        .get(0x0E06)
+                        .get(0x0039)
+                        .or_else(|| props.get(0x0E06))
                         .and_then(|v| match v {
-                            PropertyValue::Time(t) => Some(filetime_to_string(*t)),
+                            PropertyValue::Time(t) => Some(filetime_to_iso(*t)),
                             _ => None,
                         })
+                        .flatten()
                         .unwrap_or_default();
 
-                    records.push(SearchRecord {
+                    let (body_text, body_html) = if include_body {
+                        let bt = get_str_prop(0x1000);
+                        let bh = props.get(0x1013).and_then(|v| match v {
+                            PropertyValue::Binary(b) => {
+                                Some(String::from_utf8_lossy(b.buffer()).into_owned())
+                            }
+                            PropertyValue::String8(s) => Some(s.to_string()),
+                            PropertyValue::Unicode(s) => Some(s.to_string()),
+                            _ => None,
+                        });
+                        (bt, bh)
+                    } else {
+                        (None, None)
+                    };
+
+                    records.push(EmailRecord {
                         folder: folder_name.clone(),
                         subject,
                         from,
                         to,
                         cc,
                         date,
+                        body_text,
+                        body_html,
                     });
                 }
             }
@@ -788,7 +925,7 @@ fn collect_search_matches(
                 store.clone(),
                 &subfolder_entry_id,
             )?;
-            collect_search_matches(store.clone(), &subfolder, query_lower, records)?;
+            collect_search_matches(store.clone(), &subfolder, query_lower, records, include_body)?;
         }
     }
 
@@ -2696,5 +2833,82 @@ mod tests {
         assert_eq!(msg_count, 3, "expected exactly 3 messages with limit=3");
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // ── FTM output tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ftm_output_valid_jsonl() {
+        let (store, root) = open_test_store("testdata/testPST.pst");
+        let mut records: Vec<EmailRecord> = Vec::new();
+        collect_emails(Rc::clone(&store), &root, &mut records, true).unwrap();
+
+        assert!(!records.is_empty(), "expected at least one email");
+
+        for r in &records {
+            let entity = email_record_to_ftm(r);
+            let json = entity.to_ftm_json().expect("FTM entity should serialize");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&json).expect("FTM output should be valid JSON");
+            assert_eq!(parsed["schema"], "Email");
+            assert!(parsed["id"].is_string());
+            assert!(parsed["id"].as_str().unwrap().starts_with("pst-"));
+            // Verify properties wrapper exists
+            assert!(parsed["properties"].is_object(), "expected properties wrapper");
+            assert!(parsed["properties"]["subject"].is_array());
+        }
+    }
+
+    #[test]
+    fn test_ftm_output_fields() {
+        let (store, root) = open_test_store("testdata/testPST.pst");
+        let mut records: Vec<EmailRecord> = Vec::new();
+        collect_emails(Rc::clone(&store), &root, &mut records, true).unwrap();
+
+        // Find the "Feature Generators" email
+        let r = records
+            .iter()
+            .find(|r| r.subject.contains("Feature Generators") && r.from == "Jörn Kottmann")
+            .expect("expected Feature Generators email");
+
+        let entity = email_record_to_ftm(r);
+        assert!(entity.subject.is_some());
+        assert!(entity.from.is_some());
+        assert!(entity.to.is_some());
+        assert!(entity.date.is_some());
+        assert!(entity.body_text.is_some());
+
+        // Verify parent references a folder
+        let parent = entity.parent.as_ref().expect("email should have parent");
+        assert_eq!(parent.len(), 1);
+        assert!(parent[0].starts_with("pst-folder-"));
+    }
+
+    #[test]
+    fn test_ftm_folder_entities() {
+        let (store, root) = open_test_store("testdata/testPST.pst");
+        let mut records: Vec<EmailRecord> = Vec::new();
+        collect_emails(Rc::clone(&store), &root, &mut records, true).unwrap();
+
+        // Collect unique folder names
+        let folder_names: std::collections::HashSet<_> =
+            records.iter().map(|r| r.folder.as_str()).collect();
+        assert!(!folder_names.is_empty());
+
+        for name in &folder_names {
+            let folder = folder_to_ftm(name);
+            let json = folder.to_ftm_json().expect("Folder should serialize");
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed["schema"], "Folder");
+            assert!(parsed["id"].as_str().unwrap().starts_with("pst-folder-"));
+            assert_eq!(parsed["properties"]["name"][0], *name);
+        }
+
+        // Verify email parent IDs match folder IDs
+        for r in &records {
+            let entity = email_record_to_ftm(r);
+            let parent_id = &entity.parent.as_ref().unwrap()[0];
+            assert_eq!(parent_id, &ftm_folder_id(&r.folder));
+        }
     }
 }
