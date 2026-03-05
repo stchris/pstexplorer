@@ -608,7 +608,9 @@ fn collect_emails(
                     };
                     let bt = get_str_opt(0x1000);
                     let bh = props.get(0x1013).and_then(|v| match v {
-                        PropertyValue::Binary(b) => Some(String::from_utf8_lossy(b.buffer()).into_owned()),
+                        PropertyValue::Binary(b) => {
+                            Some(String::from_utf8_lossy(b.buffer()).into_owned())
+                        }
                         PropertyValue::String8(s) => Some(s.to_string()),
                         PropertyValue::Unicode(s) => Some(s.to_string()),
                         _ => None,
@@ -925,7 +927,13 @@ fn collect_search_matches(
                 store.clone(),
                 &subfolder_entry_id,
             )?;
-            collect_search_matches(store.clone(), &subfolder, query_lower, records, include_body)?;
+            collect_search_matches(
+                store.clone(),
+                &subfolder,
+                query_lower,
+                records,
+                include_body,
+            )?;
         }
     }
 
@@ -2854,7 +2862,10 @@ mod tests {
             assert!(parsed["id"].is_string());
             assert!(parsed["id"].as_str().unwrap().starts_with("pst-"));
             // Verify properties wrapper exists
-            assert!(parsed["properties"].is_object(), "expected properties wrapper");
+            assert!(
+                parsed["properties"].is_object(),
+                "expected properties wrapper"
+            );
             assert!(parsed["properties"]["subject"].is_array());
         }
     }
