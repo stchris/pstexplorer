@@ -1,6 +1,23 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [0.1.0] - 2026-03-06
+
+### Other
+
+- Installation hint
+- Add a screenshot for the browse command
+- More usage examples
+- Added example NER script with Spacy
+- Add a Datasette plugin for better email viewing
+- Add a screenshot for the datasette plugin
+- Lint, fmt and test the datasette plugin
+- Ftm entity export
+- Cargo fmt
+- Use builder API for FtmEmail
+- Add prek
+- Add prek action
+
 ## [0.1.0] - 2026-02-17
 
 ### Other

@@ -573,9 +573,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "ftm-types"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8277cd951f45e5593d3374ce7cb200794a69d3d9d984d83acb132e7222409bf9"
+checksum = "2dd9cf294424efff899fee7ef83460801bb6b6d905525a187e0aea764db4ab40"
 dependencies = [
  "anyhow",
  "bon",

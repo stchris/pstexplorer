@@ -665,21 +665,13 @@ fn ftm_folder_id(folder_name: &str) -> String {
 fn folder_to_ftm(folder_name: &str) -> FtmFolder {
     FtmFolder::builder()
         .id(ftm_folder_id(folder_name))
-        .name(vec![folder_name.to_string()])
-        .file_name(vec![folder_name.to_string()])
+        .name(folder_name)
+        .file_name(folder_name)
         .build()
 }
 
 /// Convert an `EmailRecord` to an FTM `Email` entity.
 fn email_record_to_ftm(r: &EmailRecord) -> FtmEmail {
-    let opt_vec = |s: &str| -> Option<Vec<String>> {
-        if s.is_empty() {
-            None
-        } else {
-            Some(vec![s.to_string()])
-        }
-    };
-
     // Generate a deterministic ID from subject+from+date+folder
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -692,27 +684,27 @@ fn email_record_to_ftm(r: &EmailRecord) -> FtmEmail {
         if s.is_empty() {
             None
         } else {
-            Some(vec![s.to_string()])
+            Some(s.to_string())
         }
     });
     let body_html = r.body_html.as_deref().and_then(|s| {
         if s.is_empty() {
             None
         } else {
-            Some(vec![s.to_string()])
+            Some(s.to_string())
         }
     });
 
     FtmEmail::builder()
         .id(format!("pst-{:016x}", hasher.finish()))
-        .name(vec![])
-        .file_name(vec![])
-        .maybe_subject(opt_vec(&r.subject))
-        .maybe_from(opt_vec(&r.from))
-        .maybe_to(opt_vec(&r.to))
-        .maybe_cc(opt_vec(&r.cc))
-        .maybe_date(opt_vec(&r.date))
-        .parent(vec![ftm_folder_id(&r.folder)])
+        .name("")
+        .file_name("")
+        .subject(&r.subject)
+        .from(&r.from)
+        .to(&r.to)
+        .cc(&r.cc)
+        .date(&r.date)
+        .parent(ftm_folder_id(&r.folder))
         .maybe_body_text(body_text)
         .maybe_body_html(body_html)
         .build()
