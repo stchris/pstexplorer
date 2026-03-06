@@ -23,7 +23,6 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::{io, path::PathBuf, rc::Rc, time::Instant};
 
-#[allow(deprecated)]
 use ftm_types::generated::entities::{Email as FtmEmail, Folder as FtmFolder};
 
 /// Convert a Windows FILETIME (100-ns ticks since 1601-01-01 UTC) to a
@@ -663,15 +662,15 @@ fn ftm_folder_id(folder_name: &str) -> String {
 }
 
 /// Create an FTM `Folder` entity from a folder name.
-#[allow(deprecated)]
 fn folder_to_ftm(folder_name: &str) -> FtmFolder {
-    let mut entity = FtmFolder::new(ftm_folder_id(folder_name));
-    entity.name = vec![folder_name.to_string()];
-    entity
+    FtmFolder::builder()
+        .id(ftm_folder_id(folder_name))
+        .name(vec![folder_name.to_string()])
+        .file_name(vec![folder_name.to_string()])
+        .build()
 }
 
 /// Convert an `EmailRecord` to an FTM `Email` entity.
-#[allow(deprecated)]
 fn email_record_to_ftm(r: &EmailRecord) -> FtmEmail {
     let opt_vec = |s: &str| -> Option<Vec<String>> {
         if s.is_empty() {
@@ -689,30 +688,26 @@ fn email_record_to_ftm(r: &EmailRecord) -> FtmEmail {
     r.date.hash(&mut hasher);
     r.folder.hash(&mut hasher);
 
-    let mut entity = FtmEmail::new(format!("pst-{:016x}", hasher.finish()));
-
-    entity.subject = opt_vec(&r.subject);
-    entity.from = opt_vec(&r.from);
-    entity.to = opt_vec(&r.to);
-    entity.cc = opt_vec(&r.cc);
-    entity.date = opt_vec(&r.date);
-    entity.parent = Some(vec![ftm_folder_id(&r.folder)]);
-    entity.body_text = r.body_text.as_deref().and_then(|s| {
-        if s.is_empty() {
-            None
-        } else {
-            Some(vec![s.to_string()])
-        }
+    let body_text = r.body_text.as_deref().and_then(|s| {
+        if s.is_empty() { None } else { Some(vec![s.to_string()]) }
     });
-    entity.body_html = r.body_html.as_deref().and_then(|s| {
-        if s.is_empty() {
-            None
-        } else {
-            Some(vec![s.to_string()])
-        }
+    let body_html = r.body_html.as_deref().and_then(|s| {
+        if s.is_empty() { None } else { Some(vec![s.to_string()]) }
     });
 
-    entity
+    FtmEmail::builder()
+        .id(format!("pst-{:016x}", hasher.finish()))
+        .name(vec![])
+        .file_name(vec![])
+        .maybe_subject(opt_vec(&r.subject))
+        .maybe_from(opt_vec(&r.from))
+        .maybe_to(opt_vec(&r.to))
+        .maybe_cc(opt_vec(&r.cc))
+        .maybe_date(opt_vec(&r.date))
+        .parent(vec![ftm_folder_id(&r.folder)])
+        .maybe_body_text(body_text)
+        .maybe_body_html(body_html)
+        .build()
 }
 
 /// Emit FTM JSONL: first unique Folder entities, then Email entities.
