@@ -689,10 +689,18 @@ fn email_record_to_ftm(r: &EmailRecord) -> FtmEmail {
     r.folder.hash(&mut hasher);
 
     let body_text = r.body_text.as_deref().and_then(|s| {
-        if s.is_empty() { None } else { Some(vec![s.to_string()]) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(vec![s.to_string()])
+        }
     });
     let body_html = r.body_html.as_deref().and_then(|s| {
-        if s.is_empty() { None } else { Some(vec![s.to_string()]) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(vec![s.to_string()])
+        }
     });
 
     FtmEmail::builder()
