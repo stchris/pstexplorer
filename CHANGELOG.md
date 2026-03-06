@@ -1,9 +1,9 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
-## [0.1.0] - 2026-03-06
+## [0.2.0] - 2026-03-06
 
-### Other
+### New
 
 - Installation hint
 - Add a screenshot for the browse command
@@ -17,10 +17,12 @@ All notable changes to this project will be documented in this file.
 - Use builder API for FtmEmail
 - Add prek
 - Add prek action
+- Use builder API for ftm entities
+- Simpler cliff config without conventional commits
 
 ## [0.1.0] - 2026-02-17
 
-### Other
+### New
 
 - Initial
 - Make previews work
@@ -59,8 +61,11 @@ All notable changes to this project will be documented in this file.
 - Add git-cliff
 - Initial changelog
 - Add license
+- Chore: Release pstexplorer version 0.1.0
 - Don't publish crate
 - Don't publish crate
+- Chore: Release pstexplorer version 0.1.0
 - Fix publish
+- Chore: Release pstexplorer version 0.1.0
 
 
