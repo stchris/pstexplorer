@@ -415,6 +415,7 @@ fn stats_pst(file_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 /// A single email record collected during folder traversal.
 #[derive(Serialize)]
 struct EmailRecord {
+    id: String,
     folder: String,
     subject: String,
     from: String,
@@ -467,10 +468,11 @@ fn list_emails(
                     println!("{}", serde_json::to_string_pretty(&records)?);
                 }
                 OutputFormat::Csv => {
-                    println!("folder,subject,from,to,cc,date");
+                    println!("id,folder,subject,from,to,cc,date");
                     for r in &records {
                         println!(
-                            "{},{},{},{},{},{}",
+                            "{},{},{},{},{},{},{}",
+                            csv_escape(&r.id),
                             csv_escape(&r.folder),
                             csv_escape(&r.subject),
                             csv_escape(&r.from),
@@ -481,10 +483,11 @@ fn list_emails(
                     }
                 }
                 OutputFormat::Tsv => {
-                    println!("folder\tsubject\tfrom\tto\tcc\tdate");
+                    println!("id\tfolder\tsubject\tfrom\tto\tcc\tdate");
                     for r in &records {
                         println!(
-                            "{}\t{}\t{}\t{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            tsv_escape(&r.id),
                             tsv_escape(&r.folder),
                             tsv_escape(&r.subject),
                             tsv_escape(&r.from),
@@ -552,12 +555,10 @@ fn collect_emails(
 
     if let Some(contents_table) = folder.contents_table() {
         for message_row in contents_table.rows_matrix() {
-            let message_entry_id =
-                store
-                    .properties()
-                    .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
-                        message_row.id(),
-                    )))?;
+            let message_id = u32::from(message_row.id());
+            let message_entry_id = store
+                .properties()
+                .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(message_id))?;
 
             let mut prop_ids = vec![0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06];
             if include_body {
@@ -620,6 +621,7 @@ fn collect_emails(
                 };
 
                 records.push(EmailRecord {
+                    id: message_id.to_string(),
                     folder: folder_name.clone(),
                     subject,
                     from,
@@ -672,14 +674,6 @@ fn folder_to_ftm(folder_name: &str) -> FtmFolder {
 
 /// Convert an `EmailRecord` to an FTM `Email` entity.
 fn email_record_to_ftm(r: &EmailRecord) -> FtmEmail {
-    // Generate a deterministic ID from subject+from+date+folder
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    r.subject.hash(&mut hasher);
-    r.from.hash(&mut hasher);
-    r.date.hash(&mut hasher);
-    r.folder.hash(&mut hasher);
-
     let body_text = r.body_text.as_deref().and_then(|s| {
         if s.is_empty() {
             None
@@ -696,7 +690,7 @@ fn email_record_to_ftm(r: &EmailRecord) -> FtmEmail {
     });
 
     FtmEmail::builder()
-        .id(format!("pst-{:016x}", hasher.finish()))
+        .id(format!("pst-{}", r.id))
         .name("")
         .file_name("")
         .subject(&r.subject)
@@ -759,10 +753,11 @@ fn search_emails(
                     println!("{}", serde_json::to_string_pretty(&records)?);
                 }
                 OutputFormat::Csv => {
-                    println!("folder,subject,from,to,cc,date");
+                    println!("id,folder,subject,from,to,cc,date");
                     for r in &records {
                         println!(
-                            "{},{},{},{},{},{}",
+                            "{},{},{},{},{},{},{}",
+                            csv_escape(&r.id),
                             csv_escape(&r.folder),
                             csv_escape(&r.subject),
                             csv_escape(&r.from),
@@ -773,10 +768,11 @@ fn search_emails(
                     }
                 }
                 OutputFormat::Tsv => {
-                    println!("folder\tsubject\tfrom\tto\tcc\tdate");
+                    println!("id\tfolder\tsubject\tfrom\tto\tcc\tdate");
                     for r in &records {
                         println!(
-                            "{}\t{}\t{}\t{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            tsv_escape(&r.id),
                             tsv_escape(&r.folder),
                             tsv_escape(&r.subject),
                             tsv_escape(&r.from),
@@ -816,12 +812,10 @@ fn collect_search_matches(
 
     if let Some(contents_table) = folder.contents_table() {
         for message_row in contents_table.rows_matrix() {
-            let message_entry_id =
-                store
-                    .properties()
-                    .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(u32::from(
-                        message_row.id(),
-                    )))?;
+            let message_id = u32::from(message_row.id());
+            let message_entry_id = store
+                .properties()
+                .make_entry_id(outlook_pst::ndb::node_id::NodeId::from(message_id))?;
 
             if let Ok(message) = outlook_pst::messaging::message::UnicodeMessage::read(
                 store.clone(),
@@ -896,6 +890,7 @@ fn collect_search_matches(
                     };
 
                     records.push(EmailRecord {
+                        id: message_id.to_string(),
                         folder: folder_name.clone(),
                         subject,
                         from,
