@@ -1,6 +1,13 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [0.3.0] - 2026-03-20
+
+### New
+
+- Ftm-types 0.4.0 with followthemoney 4.7.0 support
+- Add support for message ids
+
 ## [0.2.0] - 2026-03-06
 
 ### New
@@ -19,6 +26,7 @@ All notable changes to this project will be documented in this file.
 - Add prek action
 - Use builder API for ftm entities
 - Simpler cliff config without conventional commits
+- Chore: Release pstexplorer version 0.2.0
 
 ## [0.1.0] - 2026-02-17
 
