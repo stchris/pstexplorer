@@ -175,6 +175,7 @@ enum OutputFormat {
     Tsv,
     Json,
     Ftm,
+    Text,
 }
 
 #[derive(Parser)]
@@ -446,7 +447,7 @@ fn list_emails(
 
     match format {
         Some(fmt) => {
-            let include_body = matches!(fmt, OutputFormat::Ftm);
+            let include_body = matches!(fmt, OutputFormat::Ftm | OutputFormat::Text);
             // Collect all emails then output in the requested format
             let mut records: Vec<EmailRecord> = Vec::new();
             collect_emails(
@@ -500,6 +501,11 @@ fn list_emails(
                 OutputFormat::Ftm => {
                     emit_ftm_entities(&records)?;
                 }
+                OutputFormat::Text => {
+                    for r in &records {
+                        println!("{}", email_record_to_text(r));
+                    }
+                }
             }
         }
         None => {
@@ -539,6 +545,20 @@ fn csv_escape(field: &str) -> String {
 /// Escape a field for TSV output (replace tabs and newlines with spaces).
 fn tsv_escape(field: &str) -> String {
     field.replace(['\t', '\n'], " ")
+}
+
+fn email_record_to_text(record: &EmailRecord) -> String {
+    format!(
+        "id: {} date: {} from: {} to: {} cc: {} subject: {} body_text: {} body_html: {}",
+        record.id,
+        record.date,
+        record.from,
+        record.to,
+        record.cc,
+        record.subject,
+        record.body_text.as_deref().unwrap_or("").replace('\n', " "),
+        record.body_html.as_deref().unwrap_or("").replace('\n', " "),
+    )
 }
 
 /// Recursively collect email records from the folder tree.
@@ -738,7 +758,7 @@ fn search_emails(
 
     match format {
         Some(fmt) => {
-            let include_body = matches!(fmt, OutputFormat::Ftm);
+            let include_body = matches!(fmt, OutputFormat::Ftm | OutputFormat::Text);
             let mut records: Vec<EmailRecord> = Vec::new();
             collect_search_matches(
                 Rc::clone(&store),
@@ -784,6 +804,11 @@ fn search_emails(
                 }
                 OutputFormat::Ftm => {
                     emit_ftm_entities(&records)?;
+                }
+                OutputFormat::Text => {
+                    for r in &records {
+                        println!("{}", email_record_to_text(r));
+                    }
                 }
             }
         }
