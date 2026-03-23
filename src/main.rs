@@ -1227,6 +1227,16 @@ fn create_export_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX idx_messages_sender ON messages(sender);
         CREATE INDEX idx_messages_submit ON messages(submit_time);
         CREATE INDEX idx_attachments_msg ON attachments(message_id);
+
+        CREATE VIRTUAL TABLE messages_fts USING fts5(
+            subject,
+            sender,
+            to_recipients,
+            cc_recipients,
+            body_text,
+            content=messages,
+            content_rowid=id
+        );
         ",
     )
 }
@@ -1440,6 +1450,9 @@ fn export_pst(
         limit,
     )?;
     conn.execute_batch("COMMIT;")?;
+    conn.execute_batch(
+        "INSERT INTO messages_fts(messages_fts) VALUES('rebuild');",
+    )?;
 
     println!("Exported to {:?}", db_path);
     println!("  Folders:  {}", counts.0);
