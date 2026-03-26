@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
 };
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -1714,6 +1714,14 @@ struct AppState {
     search_pending: bool,
     /// When the current/last search started (for elapsed-time display).
     search_start: Option<Instant>,
+    /// Whether the sort-column popup is open.
+    sort_popup_open: bool,
+    /// Highlighted row index inside the sort popup.
+    sort_popup_selected: usize,
+    /// Currently active sort column (None = original order).
+    sort_column: Option<ColumnId>,
+    /// True = ascending, false = descending.
+    sort_ascending: bool,
 }
 
 impl PstBrowser {
@@ -1763,6 +1771,10 @@ impl AppState {
             search_mode: false,
             search_pending: false,
             search_start: None,
+            sort_popup_open: false,
+            sort_popup_selected: 0,
+            sort_column: None,
+            sort_ascending: true,
         }
     }
 
@@ -1820,6 +1832,106 @@ impl AppState {
                 self.message_rows[i] = Some(row);
             }
         }
+    }
+
+    /// Force-load every row — required before sorting so all values are known.
+    fn load_all_rows(&mut self, browser: &PstBrowser) {
+        let n = self.message_row_ids.len();
+        for i in 0..n {
+            if self.message_rows[i].is_none() {
+                let row = browser
+                    .store
+                    .properties()
+                    .make_entry_id(NodeId::from(self.message_row_ids[i]))
+                    .ok()
+                    .and_then(|eid| {
+                        UnicodeMessage::read(
+                            Rc::clone(&browser.store),
+                            &eid,
+                            Some(&[0x0037, 0x0C1A, 0x0E04, 0x0E02, 0x0039, 0x0E06]),
+                        )
+                        .ok()
+                    })
+                    .map(|msg| {
+                        let props = msg.properties();
+                        let get_str = |id: u16| -> String {
+                            props
+                                .get(id)
+                                .and_then(|v| match v {
+                                    PropertyValue::String8(s) => Some(s.to_string()),
+                                    PropertyValue::Unicode(s) => Some(s.to_string()),
+                                    _ => None,
+                                })
+                                .unwrap_or_default()
+                        };
+                        let date = props
+                            .get(0x0039)
+                            .or_else(|| props.get(0x0E06))
+                            .and_then(|v| match v {
+                                PropertyValue::Time(t) => Some(filetime_to_string(*t)),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        MessageRow {
+                            from: get_str(0x0C1A),
+                            to: get_str(0x0E04),
+                            cc: get_str(0x0E02),
+                            subject: get_str(0x0037),
+                            date,
+                        }
+                    })
+                    .unwrap_or_else(|| MessageRow {
+                        subject: "(no subject)".to_string(),
+                        ..Default::default()
+                    });
+                self.message_rows[i] = Some(row);
+            }
+        }
+    }
+
+    /// Sort `message_row_ids` / `message_folder_names` / `message_rows` by
+    /// the current `sort_column` and `sort_ascending` settings.
+    fn sort_messages(&mut self, browser: &PstBrowser) {
+        let Some(col) = self.sort_column else {
+            return;
+        };
+        self.load_all_rows(browser);
+        let n = self.message_row_ids.len();
+        // Build sort keys up-front to avoid borrowing self inside the closure.
+        let keys: Vec<String> = (0..n)
+            .map(|i| {
+                let row = self.message_rows[i].as_ref().unwrap();
+                match col {
+                    ColumnId::From => row.from.clone(),
+                    ColumnId::To => row.to.clone(),
+                    ColumnId::Cc => row.cc.clone(),
+                    ColumnId::Subject => row.subject.clone(),
+                    ColumnId::Date => row.date.clone(),
+                }
+            })
+            .collect();
+        let mut indices: Vec<usize> = (0..n).collect();
+        let ascending = self.sort_ascending;
+        indices.sort_by(|&a, &b| {
+            if ascending {
+                keys[a].cmp(&keys[b])
+            } else {
+                keys[b].cmp(&keys[a])
+            }
+        });
+        let old_ids = self.message_row_ids.clone();
+        let old_names = self.message_folder_names.clone();
+        let old_rows: Vec<_> = self.message_rows.drain(..).collect();
+        self.message_row_ids = indices.iter().map(|&i| old_ids[i]).collect();
+        self.message_folder_names = indices.iter().map(|&i| old_names[i].clone()).collect();
+        self.message_rows = indices.into_iter().map(|i| old_rows[i].clone()).collect();
+        self.message_table_state = TableState::default();
+        if n > 0 {
+            self.message_table_state.select(Some(0));
+        }
+        self.current_headers = MessageHeaders::default();
+        self.current_message_content = "Select a message to view its content".to_string();
+        self.preview_scroll = 0;
     }
 
     fn restore_all_messages(&mut self) {
@@ -2053,13 +2165,19 @@ fn draw_ui(frame: &mut ratatui::Frame, _browser: &PstBrowser, state: &mut AppSta
     draw_message_list(frame, state, main_layout[0]);
     draw_message_preview(frame, state, main_layout[1]);
 
+    if state.sort_popup_open {
+        draw_sort_popup(frame, state);
+    }
+
     let status_text = if let Some(msg) = &state.status_message {
         msg.clone()
     } else if state.search_bar_active {
         " [Search] type to search  Enter: run  Esc: cancel".to_string()
+    } else if state.sort_popup_open {
+        " [Sort] j/k: navigate  Enter: apply  Esc: close".to_string()
     } else {
         match state.active_pane {
-            ActivePane::Messages => " [Messages] j/k: navigate  Enter/Tab: preview  /: search  Esc: clear search  q: quit".to_string(),
+            ActivePane::Messages => " [Messages] j/k: navigate  Enter/Tab: preview  /: search  s: sort  Esc: clear search  q: quit".to_string(),
             ActivePane::Preview => " [Preview] j/k: scroll  Tab: → messages  /: search  Esc: clear search  q: quit".to_string(),
         }
     };
@@ -2121,6 +2239,67 @@ fn draw_search_bar(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+static SORT_COLUMNS: &[(ColumnId, &str)] = &[
+    (ColumnId::From, "From"),
+    (ColumnId::To, "To"),
+    (ColumnId::Cc, "CC"),
+    (ColumnId::Subject, "Subject"),
+    (ColumnId::Date, "Date"),
+];
+
+fn draw_sort_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    let area = frame.area();
+    let popup_width: u16 = 30;
+    let popup_height: u16 = 9; // 2 borders + 5 columns + 1 blank + 1 hint
+    let x = area.width.saturating_sub(popup_width) / 2;
+    let y = area.height.saturating_sub(popup_height) / 2;
+    let popup_area = Rect {
+        x,
+        y,
+        width: popup_width.min(area.width),
+        height: popup_height.min(area.height),
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ratatui::style::Color::Cyan))
+        .title(" Sort by ");
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (idx, (col_id, label)) in SORT_COLUMNS.iter().enumerate() {
+        let is_selected = idx == state.sort_popup_selected;
+        let is_sorted = state.sort_column == Some(*col_id);
+        let cursor = if is_selected { "▶ " } else { "  " };
+        let dir = if is_sorted {
+            if state.sort_ascending { " ▲" } else { " ▼" }
+        } else {
+            ""
+        };
+        let text = format!("{}{}{}", cursor, label, dir);
+        let style = if is_selected {
+            Style::default()
+                .fg(ratatui::style::Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else if is_sorted {
+            Style::default().fg(ratatui::style::Color::Yellow)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![Span::styled(text, style)]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        " Enter:sort  Esc:close",
+        Style::default().fg(ratatui::style::Color::DarkGray),
+    )]));
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
 fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
     // Subtract 3 for border top + header row + border bottom.
     state.message_list_height = area.height.saturating_sub(3) as usize;
@@ -2142,7 +2321,16 @@ fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     let header_cells: Vec<Cell> = visible_cols
         .iter()
         .map(|col| {
-            Cell::from(col.label).style(
+            let label = if state.sort_column == Some(col.id) {
+                if state.sort_ascending {
+                    format!("{} ▲", col.label)
+                } else {
+                    format!("{} ▼", col.label)
+                }
+            } else {
+                col.label.to_string()
+            };
+            Cell::from(label).style(
                 Style::default()
                     .fg(ratatui::style::Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -2265,6 +2453,36 @@ fn handle_events(
     {
         state.status_message = None;
 
+        // --- Sort popup input mode ---
+        if state.sort_popup_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    state.sort_popup_open = false;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    state.sort_popup_selected =
+                        (state.sort_popup_selected + 1) % SORT_COLUMNS.len();
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    state.sort_popup_selected =
+                        (state.sort_popup_selected + SORT_COLUMNS.len() - 1) % SORT_COLUMNS.len();
+                }
+                KeyCode::Enter => {
+                    let selected_col = SORT_COLUMNS[state.sort_popup_selected].0;
+                    if state.sort_column == Some(selected_col) {
+                        state.sort_ascending = !state.sort_ascending;
+                    } else {
+                        state.sort_column = Some(selected_col);
+                        state.sort_ascending = true;
+                    }
+                    state.sort_popup_open = false;
+                    state.sort_messages(browser);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         // --- Search bar input mode ---
         if state.search_bar_active {
             match key.code {
@@ -2305,6 +2523,13 @@ fn handle_events(
             }
             KeyCode::Char('/') => {
                 state.search_bar_active = true;
+            }
+            KeyCode::Char('s') => {
+                state.sort_popup_selected = state
+                    .sort_column
+                    .and_then(|col| SORT_COLUMNS.iter().position(|(c, _)| *c == col))
+                    .unwrap_or(0);
+                state.sort_popup_open = true;
             }
             KeyCode::Tab => {
                 state.active_pane = match state.active_pane {
