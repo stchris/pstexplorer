@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 outlook-pst = "1.1"
 chrono = "0.4"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 ratatui = "0.30"
 crossterm = "0.29"
 compressed-rtf = "1.0"
@@ -19,6 +19,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ftm-types = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
+ureq = { version = "3", features = ["json"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

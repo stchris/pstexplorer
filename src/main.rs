@@ -20,7 +20,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
 };
 use rusqlite::{Connection, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf, rc::Rc, time::Instant};
 
 use ftm_types::generated::entities::{Email as FtmEmail, Folder as FtmFolder};
@@ -235,6 +235,87 @@ enum Commands {
         /// Maximum number of messages to export (0 = no limit)
         #[arg(long, default_value_t = 0)]
         limit: usize,
+    },
+    /// LLM-powered commands (embed emails, ask questions)
+    Llm {
+        #[command(subcommand)]
+        command: Box<LlmCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LlmCommands {
+    /// Create embeddings for emails and store them in a ChromaDB instance
+    Embed {
+        /// Path to the PST file
+        #[arg(required = true)]
+        file: PathBuf,
+        /// ChromaDB server URL
+        #[arg(long, default_value = "http://localhost:8000")]
+        chroma_url: String,
+        /// ChromaDB collection name (default: PST filename without extension)
+        #[arg(long)]
+        collection: Option<String>,
+        /// Maximum number of messages to process (0 = no limit)
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        /// Batch size for ChromaDB upsert operations
+        #[arg(long, default_value_t = 100)]
+        batch_size: usize,
+        /// ChromaDB tenant name
+        #[arg(long, default_value = "default_tenant")]
+        tenant: String,
+        /// ChromaDB database name
+        #[arg(long, default_value = "default_database")]
+        database: String,
+        /// OpenAI-compatible embeddings API base URL (e.g. http://localhost:11434/v1 for Ollama)
+        #[arg(long)]
+        embedding_url: Option<String>,
+        /// API key for the embeddings API (or set EMBEDDING_API_KEY env var)
+        #[arg(long, env = "EMBEDDING_API_KEY")]
+        embedding_key: Option<String>,
+        /// Embedding model name
+        #[arg(long, default_value = "text-embedding-3-small")]
+        embedding_model: String,
+    },
+    /// Ask a question about your emails using RAG
+    Ask {
+        /// Question to ask
+        #[arg(required = true)]
+        question: Vec<String>,
+        /// ChromaDB collection to query
+        #[arg(long, required = true)]
+        collection: String,
+        /// ChromaDB server URL
+        #[arg(long, default_value = "http://localhost:8000")]
+        chroma_url: String,
+        /// Number of emails to retrieve as context
+        #[arg(long, short, default_value_t = 5)]
+        n_results: usize,
+        /// ChromaDB tenant name
+        #[arg(long, default_value = "default_tenant")]
+        tenant: String,
+        /// ChromaDB database name
+        #[arg(long, default_value = "default_database")]
+        database: String,
+        /// OpenAI-compatible embeddings API base URL
+        #[arg(long)]
+        embedding_url: Option<String>,
+        /// API key for the embeddings API (or set EMBEDDING_API_KEY env var)
+        #[arg(long, env = "EMBEDDING_API_KEY")]
+        embedding_key: Option<String>,
+        /// Embedding model name (must match the model used during embed)
+        #[arg(long, default_value = "text-embedding-3-small")]
+        embedding_model: String,
+        /// OpenAI-compatible chat completions API base URL
+        #[arg(long)]
+        llm_url: Option<String>,
+        /// API key for the LLM API (or set LLM_API_KEY env var)
+        #[arg(long, env = "LLM_API_KEY")]
+        llm_key: Option<String>,
+        /// Chat model name
+        #[arg(long, default_value = "gpt-4o-mini")]
+        llm_model: String,
     },
 }
 
@@ -1444,6 +1525,386 @@ fn export_pst(
     println!("Exported to {:?}", db_path);
     println!("  Folders:  {}", counts.0);
     println!("  Messages: {}", counts.1);
+    Ok(())
+}
+
+// ── ChromaDB REST API helpers ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ChromaCollection {
+    id: String,
+    name: String,
+}
+
+struct ChromaConfig<'a> {
+    url: &'a str,
+    tenant: &'a str,
+    database: &'a str,
+}
+
+struct EmbedConfig<'a> {
+    url: &'a str,
+    key: Option<&'a str>,
+    model: &'a str,
+}
+
+struct LlmConfig<'a> {
+    url: &'a str,
+    key: Option<&'a str>,
+    model: &'a str,
+}
+
+fn chroma_heartbeat(cfg: &ChromaConfig<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/api/v2/heartbeat", cfg.url);
+    ureq::get(&url)
+        .call()
+        .map_err(|e| format!("ChromaDB unreachable at {}: {}", cfg.url, e))?;
+    Ok(())
+}
+
+fn chroma_get_or_create_collection(
+    cfg: &ChromaConfig<'_>,
+    name: &str,
+) -> Result<ChromaCollection, Box<dyn std::error::Error>> {
+    let get_url = format!(
+        "{}/api/v2/tenants/{}/databases/{}/collections/{}",
+        cfg.url, cfg.tenant, cfg.database, name
+    );
+    let resp = ureq::get(&get_url).call();
+    match resp {
+        Ok(mut r) => Ok(r.body_mut().read_json::<ChromaCollection>()?),
+        Err(ureq::Error::StatusCode(404)) => {
+            let post_url = format!(
+                "{}/api/v2/tenants/{}/databases/{}/collections",
+                cfg.url, cfg.tenant, cfg.database
+            );
+            let body = serde_json::json!({ "name": name });
+            let mut r = ureq::post(&post_url)
+                .config()
+                .http_status_as_error(false)
+                .build()
+                .send_json(body)
+                .map_err(|e| format!("Failed to connect to ChromaDB: {}", e))?;
+            if !r.status().is_success() {
+                let status = r.status();
+                let detail = r.body_mut().read_to_string().unwrap_or_default();
+                return Err(format!(
+                    "Failed to create collection '{}' (HTTP {}): {}",
+                    name, status, detail
+                )
+                .into());
+            }
+            Ok(r.body_mut().read_json::<ChromaCollection>()?)
+        }
+        Err(e) => Err(format!("Failed to get collection '{}': {}", name, e).into()),
+    }
+}
+
+fn chroma_post<T: serde::ser::Serialize>(
+    url: &str,
+    body: &T,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut resp = ureq::post(url)
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send_json(body)
+        .map_err(|e| format!("Failed to connect to ChromaDB: {}", e))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(format!("ChromaDB error (HTTP {}): {}", status, detail).into());
+    }
+    Ok(())
+}
+
+fn chroma_add_documents(
+    cfg: &ChromaConfig<'_>,
+    collection_id: &str,
+    ids: Vec<String>,
+    documents: Vec<String>,
+    metadatas: Vec<serde_json::Value>,
+    embeddings: Vec<Vec<f32>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/api/v2/tenants/{}/databases/{}/collections/{}/add",
+        cfg.url, cfg.tenant, cfg.database, collection_id
+    );
+    let body = serde_json::json!({
+        "ids": ids,
+        "documents": documents,
+        "metadatas": metadatas,
+        "embeddings": embeddings,
+    });
+    chroma_post(&url, &body)
+}
+
+fn call_embeddings_api(
+    emb: &EmbedConfig<'_>,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    let api_url = emb.url;
+    let api_key = emb.key;
+    let model = emb.model;
+    let url = format!("{}/embeddings", api_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "input": texts, "model": model });
+
+    let auth_header = api_key.map(|k| format!("Bearer {}", k));
+    let mut builder = ureq::post(&url)
+        .config()
+        .http_status_as_error(false)
+        .build();
+    if let Some(ref auth) = auth_header {
+        builder = builder.header("Authorization", auth);
+    }
+
+    let mut resp = builder
+        .send_json(&body)
+        .map_err(|e| format!("Failed to connect to embeddings API: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(format!("Embeddings API error (HTTP {}): {}", status, detail).into());
+    }
+
+    let json: serde_json::Value = resp.body_mut().read_json()?;
+    let data = json["data"]
+        .as_array()
+        .ok_or("Embeddings API: missing 'data' array")?;
+
+    let mut results = vec![vec![]; data.len()];
+    for item in data {
+        let index = item["index"]
+            .as_u64()
+            .ok_or("Embeddings API: missing 'index'")? as usize;
+        let embedding = item["embedding"]
+            .as_array()
+            .ok_or("Embeddings API: missing 'embedding'")?
+            .iter()
+            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+            .collect();
+        results[index] = embedding;
+    }
+    Ok(results)
+}
+
+fn embed_emails(
+    file_path: &PathBuf,
+    collection_name: &str,
+    limit: usize,
+    batch_size: usize,
+    chroma: &ChromaConfig<'_>,
+    emb: &EmbedConfig<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    chroma_heartbeat(chroma)?;
+    let collection = chroma_get_or_create_collection(chroma, collection_name)?;
+    eprintln!(
+        "Collection '{}' ready (id: {})",
+        collection.name, collection.id
+    );
+
+    let pst = UnicodePstFile::open(file_path)?;
+    let store = Rc::new(UnicodeStore::read(Rc::new(pst))?);
+    let ipm_sub_tree_entry_id = store.properties().ipm_sub_tree_entry_id()?;
+    let root_folder = UnicodeFolder::read(Rc::clone(&store), &ipm_sub_tree_entry_id)?;
+
+    let mut records: Vec<EmailRecord> = Vec::new();
+    collect_emails(Rc::clone(&store), &root_folder, &mut records, true)?;
+
+    if limit > 0 {
+        records.truncate(limit);
+    }
+
+    let total = records.len();
+    eprintln!("Processing {} emails...", total);
+
+    let mut added = 0usize;
+    for (batch_num, chunk) in records.chunks(batch_size).enumerate() {
+        let mut ids = Vec::with_capacity(chunk.len());
+        let mut documents = Vec::with_capacity(chunk.len());
+        let mut metadatas = Vec::with_capacity(chunk.len());
+
+        for record in chunk {
+            let body = if let Some(ref bt) = record.body_text {
+                bt.clone()
+            } else if let Some(ref bh) = record.body_html {
+                html_to_text(bh)
+            } else {
+                String::new()
+            };
+
+            let doc_text = format!("Subject: {}\n\n{}", record.subject, body);
+            if record.subject.is_empty() && body.is_empty() {
+                continue;
+            }
+
+            ids.push(format!("pst-{}", record.id));
+            documents.push(doc_text);
+            metadatas.push(serde_json::json!({
+                "folder": record.folder,
+                "subject": record.subject,
+                "from": record.from,
+                "to": record.to,
+                "cc": record.cc,
+                "date": record.date,
+                "pst_id": record.id,
+            }));
+        }
+
+        let n = ids.len();
+        let embeddings = call_embeddings_api(emb, &documents)?;
+        chroma_add_documents(
+            chroma,
+            &collection.id,
+            ids,
+            documents,
+            metadatas,
+            embeddings,
+        )?;
+        added += n;
+        eprintln!("  Batch {}: {} documents added", batch_num + 1, n);
+    }
+
+    println!("Embeddings stored in ChromaDB at {}", chroma.url);
+    println!("  Collection: {}", collection_name);
+    println!("  Documents:  {}", added);
+    Ok(())
+}
+
+fn chroma_query(
+    cfg: &ChromaConfig<'_>,
+    collection_id: &str,
+    query_embedding: Vec<f32>,
+    n_results: usize,
+) -> Result<(Vec<String>, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/api/v2/tenants/{}/databases/{}/collections/{}/query",
+        cfg.url, cfg.tenant, cfg.database, collection_id
+    );
+    let body = serde_json::json!({
+        "query_embeddings": [query_embedding],
+        "n_results": n_results,
+        "include": ["documents", "metadatas"],
+    });
+    let mut resp = ureq::post(&url)
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send_json(&body)
+        .map_err(|e| format!("Failed to query ChromaDB: {}", e))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(format!("ChromaDB query failed (HTTP {}): {}", status, detail).into());
+    }
+    let json: serde_json::Value = resp.body_mut().read_json()?;
+    let documents = json["documents"][0]
+        .as_array()
+        .ok_or("ChromaDB response missing documents")?
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect();
+    let metadatas = json["metadatas"][0]
+        .as_array()
+        .ok_or("ChromaDB response missing metadatas")?
+        .to_vec();
+    Ok((documents, metadatas))
+}
+
+fn call_chat_api(
+    llm: &LlmConfig<'_>,
+    system: &str,
+    user: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let url = format!("{}/chat/completions", llm.url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": llm.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+    });
+    let auth_header = llm.key.map(|k| format!("Bearer {}", k));
+    let mut builder = ureq::post(&url)
+        .config()
+        .http_status_as_error(false)
+        .build();
+    if let Some(ref auth) = auth_header {
+        builder = builder.header("Authorization", auth);
+    }
+    let mut resp = builder
+        .send_json(&body)
+        .map_err(|e| format!("Failed to connect to LLM API: {}", e))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(format!("LLM API error (HTTP {}): {}", status, detail).into());
+    }
+    let json: serde_json::Value = resp.body_mut().read_json()?;
+    let content = json["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or("LLM response missing content")?
+        .to_string();
+    Ok(content)
+}
+
+fn ask_llm(
+    question: &str,
+    collection_name: &str,
+    n_results: usize,
+    chroma: &ChromaConfig<'_>,
+    emb: &EmbedConfig<'_>,
+    llm: &LlmConfig<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Embed the question
+    let embeddings = call_embeddings_api(emb, &[question.to_string()])?;
+    let query_embedding = embeddings
+        .into_iter()
+        .next()
+        .ok_or("No embedding returned")?;
+
+    // Find the collection
+    let collection = chroma_get_or_create_collection(chroma, collection_name)?;
+
+    // Query ChromaDB
+    let (documents, metadatas) = chroma_query(chroma, &collection.id, query_embedding, n_results)?;
+
+    if documents.is_empty() {
+        println!("No relevant emails found.");
+        return Ok(());
+    }
+
+    // Build context block
+    let context = documents
+        .iter()
+        .zip(metadatas.iter())
+        .enumerate()
+        .map(|(i, (doc, meta))| {
+            let from = meta["from"].as_str().unwrap_or("");
+            let date = meta["date"].as_str().unwrap_or("");
+            let subject = meta["subject"].as_str().unwrap_or("");
+            let folder = meta["folder"].as_str().unwrap_or("");
+            format!(
+                "[{}] Folder: {} | From: {} | Date: {} | Subject: {}\n\n{}",
+                i + 1,
+                folder,
+                from,
+                date,
+                subject,
+                doc
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+
+    let system = "You are an assistant that answers questions about emails. \
+                  Answer using only the emails provided. \
+                  If the answer is not in the emails, say so.";
+    let user = format!("Emails:\n\n{}\n\n---\n\nQuestion: {}", context, question);
+
+    let answer = call_chat_api(llm, system, &user)?;
+    println!("{}", answer);
     Ok(())
 }
 
@@ -2685,6 +3146,110 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Llm { command } => match command.as_ref() {
+            LlmCommands::Embed {
+                file,
+                chroma_url,
+                collection,
+                limit,
+                batch_size,
+                tenant,
+                database,
+                embedding_url,
+                embedding_key,
+                embedding_model,
+            } => {
+                let coll_name = collection.clone().unwrap_or_else(|| {
+                    file.file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                let chroma = ChromaConfig {
+                    url: chroma_url,
+                    tenant,
+                    database,
+                };
+                let emb = EmbedConfig {
+                    url: embedding_url.as_deref().unwrap_or(""),
+                    key: embedding_key.as_deref(),
+                    model: embedding_model,
+                };
+                if embedding_url.is_none() {
+                    eprintln!(
+                        "Error: ChromaDB's REST API requires embeddings to be provided. \
+                         Use --embedding-url to specify an OpenAI-compatible embeddings API.\n\
+                         Examples:\n\
+                           Ollama: --embedding-url http://localhost:11434/v1 --embedding-model nomic-embed-text\n\
+                           OpenAI: --embedding-url https://api.openai.com/v1 --embedding-key sk-..."
+                    );
+                    std::process::exit(1);
+                }
+                if let Err(e) = embed_emails(file, &coll_name, *limit, *batch_size, &chroma, &emb) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            LlmCommands::Ask {
+                question,
+                collection,
+                chroma_url,
+                n_results,
+                tenant,
+                database,
+                embedding_url,
+                embedding_key,
+                embedding_model,
+                llm_url,
+                llm_key,
+                llm_model,
+            } => {
+                let q = question.join(" ");
+                let chroma = ChromaConfig {
+                    url: chroma_url,
+                    tenant,
+                    database,
+                };
+                let emb_url = match embedding_url.as_deref() {
+                    Some(u) => u,
+                    None => {
+                        eprintln!(
+                            "Error: Use --embedding-url to specify an OpenAI-compatible embeddings API.\n\
+                             Examples:\n\
+                               Ollama: --embedding-url http://localhost:11434/v1 --embedding-model nomic-embed-text\n\
+                               OpenAI: --embedding-url https://api.openai.com/v1 --embedding-key sk-..."
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                let chat_url = match llm_url.as_deref() {
+                    Some(u) => u,
+                    None => {
+                        eprintln!(
+                            "Error: Use --llm-url to specify an OpenAI-compatible chat completions API.\n\
+                             Examples:\n\
+                               Ollama: --llm-url http://localhost:11434/v1 --llm-model llama3.2\n\
+                               OpenAI: --llm-url https://api.openai.com/v1 --llm-key sk-..."
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                let emb = EmbedConfig {
+                    url: emb_url,
+                    key: embedding_key.as_deref(),
+                    model: embedding_model,
+                };
+                let llm = LlmConfig {
+                    url: chat_url,
+                    key: llm_key.as_deref(),
+                    model: llm_model,
+                };
+                if let Err(e) = ask_llm(&q, collection, *n_results, &chroma, &emb, &llm) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 }
 

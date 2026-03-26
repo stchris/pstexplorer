@@ -17,6 +17,7 @@ Commands:
   browse  Browse PST file contents in a TUI
   stats   Print statistics about a PST file
   export  Export a PST file to a SQLite database
+  llm     LLM-powered commands (embed emails, ask questions)
 ```
 
 ## Features
@@ -78,6 +79,69 @@ Export folders and messages to a SQLite database for further analysis. Use `--ou
 Interactive terminal UI for navigating folders and reading messages.
 
 ![A screen showing the TUI for the browse command](./screenshot-browse.png)
+
+### llm embed
+
+Index emails into a [ChromaDB](https://www.trychroma.com/) vector database. Embeddings are generated via any OpenAI-compatible API — locally with [Ollama](https://ollama.com/) or remotely with OpenAI.
+
+The collection name defaults to the PST filename stem (e.g. `testPST.pst` → `testPST`).
+
+```bash
+# with Ollama
+pstexplorer llm embed testPST.pst \
+  --embedding-url http://localhost:11434/v1 \
+  --embedding-model nomic-embed-text
+
+# with OpenAI
+pstexplorer llm embed testPST.pst \
+  --embedding-url https://api.openai.com/v1 \
+  --embedding-key sk-... \
+  --embedding-model text-embedding-3-small
+```
+
+### llm ask
+
+Ask a natural language question about your emails. Relevant messages are retrieved from ChromaDB and passed as context to a chat model.
+
+> [!IMPORTANT]
+> The `--embedding-model` must match the model used during `llm embed`.
+
+```bash
+# with Ollama
+pstexplorer llm ask --collection testPST \
+  --embedding-url http://localhost:11434/v1 \
+  --embedding-model nomic-embed-text \
+  --llm-url http://localhost:11434/v1 \
+  --llm-model llama3.2 \
+  "who sent me invoices last year?"
+
+# with OpenAI
+pstexplorer llm ask --collection testPST \
+  --embedding-url https://api.openai.com/v1 \
+  --embedding-model text-embedding-3-small \
+  --llm-url https://api.openai.com/v1 \
+  --llm-model gpt-4o-mini \
+  "summarise the thread about the budget"
+```
+
+API keys can also be set via environment variables to keep them out of shell history:
+
+```bash
+export EMBEDDING_API_KEY=sk-...
+export LLM_API_KEY=sk-...
+```
+
+Use `--n-results` (default: 5) to control how many emails are retrieved as context.
+
+### Alternative: llmquery/query.py
+
+`llmquery/query.py` is a standalone script that does the same RAG query using the Python `chromadb` and `ollama` libraries directly. It requires a locally running Ollama instance and is self-contained with inline dependency metadata — only `uv` is needed.
+
+```bash
+./llmquery/query.py "who sent me invoices in 2023?"
+./llmquery/query.py --collection testPST "what is the date and time of the oldest email?"
+./llmquery/query.py --collection testPST --n-results 10 "which emails contain source code?"
+```
 
 # Datasette plugin
 
