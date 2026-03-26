@@ -1928,10 +1928,8 @@ impl AppState {
         self.message_table_state = TableState::default();
         if n > 0 {
             self.message_table_state.select(Some(0));
+            self.select_message(browser, 0);
         }
-        self.current_headers = MessageHeaders::default();
-        self.current_message_content = "Select a message to view its content".to_string();
-        self.preview_scroll = 0;
     }
 
     fn restore_all_messages(&mut self) {
@@ -2063,6 +2061,10 @@ fn browse_pst(file_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 let backend = CrosstermBackend::new(stdout);
                 if let Ok(mut terminal) = Terminal::new(backend) {
                     let mut app_state = AppState::new(&browser);
+                    // Pre-populate the preview for the initially selected message.
+                    if !app_state.message_row_ids.is_empty() {
+                        app_state.select_message(&browser, 0);
+                    }
 
                     // Main loop
                     while !app_state.exit {
