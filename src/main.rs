@@ -2180,7 +2180,7 @@ fn draw_ui(frame: &mut ratatui::Frame, _browser: &PstBrowser, state: &mut AppSta
     } else {
         match state.active_pane {
             ActivePane::Messages => " [Messages] j/k: navigate  Enter/Tab: preview  /: search  s: sort  Esc: clear search  q: quit".to_string(),
-            ActivePane::Preview => " [Preview] j/k: scroll  Tab: → messages  /: search  Esc: clear search  q: quit".to_string(),
+            ActivePane::Preview => " [Preview] j/k: scroll  Esc/Tab: → messages  /: search  q: quit".to_string(),
         }
     };
     let status_style = if state.status_message.is_some() {
@@ -2519,6 +2519,8 @@ fn handle_events(
             KeyCode::Esc => {
                 if state.search_mode {
                     state.restore_all_messages();
+                } else if state.active_pane == ActivePane::Preview {
+                    state.active_pane = ActivePane::Messages;
                 } else {
                     state.exit = true;
                 }
