@@ -1,12 +1,23 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [0.4.0] - 2026-03-26
+
+### New
+
+- Add output format 'text'
+- Browse TUI: allow sorting by column
+- Fix preview pane not being populated
+- Browse: fix navigating back to the message list after scrolling a message
+- Browse TUI: highlight search terms
+
 ## [0.3.0] - 2026-03-20
 
 ### New
 
 - Ftm-types 0.4.0 with followthemoney 4.7.0 support
 - Add support for message ids
+- Chore: Release pstexplorer version 0.3.0
 
 ## [0.2.0] - 2026-03-06
 

@@ -1,6 +1,6 @@
 [package]
 name = "pstexplorer"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 repository = "https://github.com/stchris/pstexplorer"
 description = "A CLI tool to explore and extract data from Outlook PST files"
