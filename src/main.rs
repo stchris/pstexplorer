@@ -2241,6 +2241,48 @@ fn draw_search_bar(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Split `text` into [`Span`]s, applying `hl` to every case-insensitive
+/// occurrence of `query` and leaving the rest unstyled.
+fn highlight_spans(text: &str, query: &str, hl: Style) -> Vec<Span<'static>> {
+    if query.is_empty() {
+        return vec![Span::raw(text.to_string())];
+    }
+    let lower_text = text.to_lowercase();
+    let lower_query = query.to_lowercase();
+    let qlen = lower_query.len();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut last = 0;
+    loop {
+        match lower_text[last..].find(lower_query.as_str()) {
+            None => break,
+            Some(rel) => {
+                let start = last + rel;
+                let end = start + qlen;
+                // Guard against byte-boundary issues with non-ASCII case folding.
+                if end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end)
+                {
+                    break;
+                }
+                if start > last {
+                    spans.push(Span::raw(text[last..start].to_string()));
+                }
+                spans.push(Span::styled(text[start..end].to_string(), hl));
+                last = end;
+            }
+        }
+        if last >= text.len() {
+            break;
+        }
+    }
+    if last < text.len() {
+        spans.push(Span::raw(text[last..].to_string()));
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(text.to_string()));
+    }
+    spans
+}
+
 static SORT_COLUMNS: &[(ColumnId, &str)] = &[
     (ColumnId::From, "From"),
     (ColumnId::To, "To"),
@@ -2345,6 +2387,10 @@ fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     let rows: Vec<Row> = (0..count)
         .map(|i| {
             let row_data = state.message_rows[i].as_ref().unwrap_or(&empty);
+            let hl = Style::default()
+                .bg(ratatui::style::Color::Yellow)
+                .fg(ratatui::style::Color::Black)
+                .add_modifier(Modifier::BOLD);
             let cells: Vec<Cell> = visible_cols
                 .iter()
                 .map(|col| {
@@ -2355,11 +2401,16 @@ fn draw_message_list(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
                         ColumnId::Subject => &row_data.subject,
                         ColumnId::Date => &row_data.date,
                     };
-                    Cell::from(if val.is_empty() && matches!(col.id, ColumnId::Subject) {
-                        "\u{2026}" // ellipsis for loading
+                    let text = if val.is_empty() && matches!(col.id, ColumnId::Subject) {
+                        "\u{2026}".to_string() // ellipsis for loading
                     } else {
-                        val.as_str()
-                    })
+                        val.clone()
+                    };
+                    if state.search_mode && !state.search_input.is_empty() {
+                        Cell::from(Line::from(highlight_spans(&text, &state.search_input, hl)))
+                    } else {
+                        Cell::from(text)
+                    }
                 })
                 .collect();
             Row::new(cells)
@@ -2403,33 +2454,39 @@ fn draw_message_preview(frame: &mut ratatui::Frame, state: &AppState, area: Rect
         .add_modifier(Modifier::BOLD);
     let value_style = Style::default();
 
+    let hl = Style::default()
+        .bg(ratatui::style::Color::Yellow)
+        .fg(ratatui::style::Color::Black)
+        .add_modifier(Modifier::BOLD);
+    let search_active = state.search_mode && !state.search_input.is_empty();
+
+    // Build a header line: styled label + optionally-highlighted value.
+    let header_line = |label: &'static str, value: &str| -> Line<'static> {
+        let mut spans = vec![Span::styled(label, label_style)];
+        if search_active {
+            spans.extend(highlight_spans(value, &state.search_input, hl));
+        } else {
+            spans.push(Span::styled(value.to_string(), value_style));
+        }
+        Line::from(spans)
+    };
+
     let h = &state.current_headers;
     let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled("From:    ", label_style),
-            Span::styled(h.from.clone(), value_style),
-        ]),
-        Line::from(vec![
-            Span::styled("To:      ", label_style),
-            Span::styled(h.to.clone(), value_style),
-        ]),
-        Line::from(vec![
-            Span::styled("CC:      ", label_style),
-            Span::styled(h.cc.clone(), value_style),
-        ]),
-        Line::from(vec![
-            Span::styled("Subject: ", label_style),
-            Span::styled(h.subject.clone(), value_style),
-        ]),
-        Line::from(vec![
-            Span::styled("Date:    ", label_style),
-            Span::styled(h.date.clone(), value_style),
-        ]),
+        header_line("From:    ", &h.from),
+        header_line("To:      ", &h.to),
+        header_line("CC:      ", &h.cc),
+        header_line("Subject: ", &h.subject),
+        header_line("Date:    ", &h.date),
         Line::from("─".repeat(area.width.saturating_sub(2) as usize)),
     ];
 
     for line in state.current_message_content.lines() {
-        lines.push(Line::from(line.to_string()));
+        if search_active {
+            lines.push(Line::from(highlight_spans(line, &state.search_input, hl)));
+        } else {
+            lines.push(Line::from(line.to_string()));
+        }
     }
 
     let preview = Paragraph::new(Text::from(lines))
