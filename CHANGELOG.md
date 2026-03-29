@@ -1,6 +1,13 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [0.5.0] - 2026-03-29
+
+### New
+
+- Add llm subcommands for embeddings and asking questions
+- Add AGENTS.md
+
 ## [0.4.0] - 2026-03-26
 
 ### New
@@ -10,6 +17,7 @@ All notable changes to this project will be documented in this file.
 - Fix preview pane not being populated
 - Browse: fix navigating back to the message list after scrolling a message
 - Browse TUI: highlight search terms
+- Chore: Release pstexplorer version 0.4.0
 
 ## [0.3.0] - 2026-03-20
 
