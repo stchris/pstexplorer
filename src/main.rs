@@ -1325,11 +1325,12 @@ fn create_export_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             data         BLOB
         );
 
-        CREATE INDEX idx_messages_folder ON messages(folder_id);
-        CREATE INDEX idx_messages_class  ON messages(message_class);
-        CREATE INDEX idx_messages_sender ON messages(sender);
-        CREATE INDEX idx_messages_submit ON messages(submit_time);
-        CREATE INDEX idx_attachments_msg ON attachments(message_id);
+        CREATE INDEX idx_messages_folder   ON messages(folder_id);
+        CREATE INDEX idx_messages_class    ON messages(message_class);
+        CREATE INDEX idx_messages_sender   ON messages(sender);
+        CREATE INDEX idx_messages_submit   ON messages(submit_time);
+        CREATE INDEX idx_messages_delivery ON messages(delivery_time);
+        CREATE INDEX idx_attachments_msg   ON attachments(message_id);
         ",
     )
 }
@@ -1587,11 +1588,12 @@ fn create_export_schema_postgres(client: &mut Client) -> Result<(), postgres::Er
             data         BYTEA
         );
 
-        CREATE INDEX idx_messages_folder ON messages(folder_id);
-        CREATE INDEX idx_messages_class  ON messages(message_class);
-        CREATE INDEX idx_messages_sender ON messages(sender);
-        CREATE INDEX idx_messages_submit ON messages(submit_time);
-        CREATE INDEX idx_attachments_msg ON attachments(message_id);
+        CREATE INDEX idx_messages_folder   ON messages(folder_id);
+        CREATE INDEX idx_messages_class    ON messages(message_class);
+        CREATE INDEX idx_messages_sender   ON messages(sender);
+        CREATE INDEX idx_messages_submit   ON messages(submit_time);
+        CREATE INDEX idx_messages_delivery ON messages(delivery_time);
+        CREATE INDEX idx_attachments_msg   ON attachments(message_id);
         ",
     )
 }
