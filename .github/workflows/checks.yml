@@ -10,6 +10,20 @@ jobs:
   ci:
     name: CI
     runs-on: ubuntu-slim
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pstexplorer
+          POSTGRES_PASSWORD: pstexplorer
+          POSTGRES_DB: pstexplorer
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -19,3 +33,7 @@ jobs:
           override: true
           components: rustfmt, clippy
       - uses: j178/prek-action@v1
+      - name: Run integration tests (postgres)
+        env:
+          POSTGRES_TEST_URL: postgres://pstexplorer:pstexplorer@localhost:5433/pstexplorer
+        run: cargo test -- --ignored
