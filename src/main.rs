@@ -259,6 +259,9 @@ enum ExportCommands {
         /// PostgreSQL connection string (e.g. postgres://user:pass@host/db)
         #[arg(short, long)]
         connection: String,
+        /// Create the tables before exporting (fails if they already exist)
+        #[arg(long)]
+        create_tables: bool,
         /// Maximum number of messages to export (0 = no limit)
         #[arg(long, default_value_t = 0)]
         limit: usize,
@@ -1759,6 +1762,7 @@ fn export_folder_postgres(
 fn export_pst_postgres(
     file_path: &PathBuf,
     connection: &str,
+    create_tables: bool,
     limit: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pst = UnicodePstFile::open(file_path)?;
@@ -1767,7 +1771,9 @@ fn export_pst_postgres(
     let ipm_subtree_folder = UnicodeFolder::read(Rc::clone(&store), &ipm_sub_tree_entry_id)?;
 
     let mut client = Client::connect(connection, NoTls)?;
-    create_export_schema_postgres(&mut client)?;
+    if create_tables {
+        create_export_schema_postgres(&mut client)?;
+    }
 
     let mut counts: (usize, usize) = (0, 0);
     let mut tx = client.transaction()?;
@@ -3410,9 +3416,10 @@ fn main() {
             ExportCommands::Postgres {
                 file,
                 connection,
+                create_tables,
                 limit,
             } => {
-                if let Err(e) = export_pst_postgres(file, connection, *limit) {
+                if let Err(e) = export_pst_postgres(file, connection, *create_tables, *limit) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
@@ -4011,7 +4018,7 @@ mod tests {
         drop_export_tables(&mut client);
         drop(client);
 
-        export_pst_postgres(&PathBuf::from("testdata/sample.pst"), &url, 0)
+        export_pst_postgres(&PathBuf::from("testdata/sample.pst"), &url, true, 0)
             .expect("postgres export should succeed");
 
         let mut client = Client::connect(&url, NoTls).unwrap();
@@ -4050,7 +4057,7 @@ mod tests {
         drop_export_tables(&mut client);
         drop(client);
 
-        export_pst_postgres(&PathBuf::from("testdata/sample.pst"), &url, 0)
+        export_pst_postgres(&PathBuf::from("testdata/sample.pst"), &url, true, 0)
             .expect("postgres export should succeed");
 
         let mut client = Client::connect(&url, NoTls).unwrap();
@@ -4071,7 +4078,7 @@ mod tests {
         drop_export_tables(&mut client);
         drop(client);
 
-        export_pst_postgres(&PathBuf::from("testdata/testPST.pst"), &url, 0)
+        export_pst_postgres(&PathBuf::from("testdata/testPST.pst"), &url, true, 0)
             .expect("postgres export should succeed");
 
         let mut client = Client::connect(&url, NoTls).unwrap();
@@ -4100,7 +4107,7 @@ mod tests {
         drop(client);
 
         let limit: usize = 3;
-        export_pst_postgres(&PathBuf::from("testdata/testPST.pst"), &url, limit)
+        export_pst_postgres(&PathBuf::from("testdata/testPST.pst"), &url, true, limit)
             .expect("postgres export should succeed");
 
         let mut client = Client::connect(&url, NoTls).unwrap();
