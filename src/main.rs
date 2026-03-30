@@ -19,6 +19,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
 };
+use postgres::{Client, NoTls};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf, rc::Rc, time::Instant};
@@ -224,8 +225,22 @@ enum Commands {
         #[arg(required = true)]
         file: PathBuf,
     },
-    /// Export a PST file to a SQLite database
+    /// Export a PST file to a database (sqlite or postgres)
     Export {
+        #[command(subcommand)]
+        command: Box<ExportCommands>,
+    },
+    /// LLM-powered commands (embed emails, ask questions)
+    Llm {
+        #[command(subcommand)]
+        command: Box<LlmCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExportCommands {
+    /// Export to a SQLite database
+    Sqlite {
         /// Path to the PST file
         #[arg(required = true)]
         file: PathBuf,
@@ -236,10 +251,17 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         limit: usize,
     },
-    /// LLM-powered commands (embed emails, ask questions)
-    Llm {
-        #[command(subcommand)]
-        command: Box<LlmCommands>,
+    /// Export to a PostgreSQL database
+    Postgres {
+        /// Path to the PST file
+        #[arg(required = true)]
+        file: PathBuf,
+        /// PostgreSQL connection string (e.g. postgres://user:pass@host/db)
+        #[arg(short, long)]
+        connection: String,
+        /// Maximum number of messages to export (0 = no limit)
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
     },
 }
 
@@ -1523,6 +1545,242 @@ fn export_pst(
     conn.execute_batch("COMMIT;")?;
 
     println!("Exported to {:?}", db_path);
+    println!("  Folders:  {}", counts.0);
+    println!("  Messages: {}", counts.1);
+    Ok(())
+}
+
+// ── PostgreSQL Export ────────────────────────────────────────────────────────
+
+fn create_export_schema_postgres(client: &mut Client) -> Result<(), postgres::Error> {
+    client.batch_execute(
+        "
+        CREATE TABLE folders (
+            id        BIGSERIAL PRIMARY KEY,
+            parent_id BIGINT REFERENCES folders(id),
+            name      TEXT NOT NULL,
+            path      TEXT NOT NULL
+        );
+
+        CREATE TABLE messages (
+            id               BIGSERIAL PRIMARY KEY,
+            folder_id        BIGINT NOT NULL REFERENCES folders(id),
+            message_class    TEXT NOT NULL,
+            subject          TEXT,
+            sender           TEXT,
+            to_recipients    TEXT,
+            cc_recipients    TEXT,
+            submit_time      TEXT,
+            delivery_time    TEXT,
+            body_text        TEXT,
+            body_html        TEXT,
+            body_rtf         BYTEA,
+            attachment_count INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE attachments (
+            id           BIGSERIAL PRIMARY KEY,
+            message_id   BIGINT NOT NULL REFERENCES messages(id),
+            filename     TEXT,
+            content_type TEXT,
+            size         INTEGER,
+            data         BYTEA
+        );
+
+        CREATE INDEX idx_messages_folder ON messages(folder_id);
+        CREATE INDEX idx_messages_class  ON messages(message_class);
+        CREATE INDEX idx_messages_sender ON messages(sender);
+        CREATE INDEX idx_messages_submit ON messages(submit_time);
+        CREATE INDEX idx_attachments_msg ON attachments(message_id);
+        ",
+    )
+}
+
+fn export_folder_postgres(
+    store: Rc<UnicodeStore>,
+    folder: &UnicodeFolder,
+    parent_folder_id: Option<i64>,
+    path_prefix: &str,
+    tx: &mut postgres::Transaction<'_>,
+    counts: &mut (usize, usize),
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let folder_name = folder
+        .properties()
+        .display_name()
+        .unwrap_or_else(|_| "Unknown".to_string());
+    let path = if path_prefix.is_empty() {
+        folder_name.clone()
+    } else {
+        format!("{}/{}", path_prefix, folder_name)
+    };
+
+    let row = tx.query_one(
+        "INSERT INTO folders (parent_id, name, path) VALUES ($1, $2, $3) RETURNING id",
+        &[&parent_folder_id, &folder_name, &path],
+    )?;
+    let folder_id: i64 = row.get(0);
+    counts.0 += 1;
+
+    if let Some(contents_table) = folder.contents_table() {
+        for row in contents_table.rows_matrix() {
+            if limit > 0 && counts.1 >= limit {
+                break;
+            }
+            let row_id = u32::from(row.id());
+            let entry_id = match store.properties().make_entry_id(NodeId::from(row_id)) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            let message = match UnicodeMessage::read(
+                Rc::clone(&store),
+                &entry_id,
+                Some(&[
+                    0x0037, 0x001A, 0x0039, 0x0C1A, 0x0E02, 0x0E04, 0x0E06, 0x0E13, 0x1000,
+                    0x1009, 0x1013,
+                ]),
+            ) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let props = message.properties();
+
+            let get_str = |id: u16| -> Option<String> {
+                props.get(id).and_then(|v| match v {
+                    PropertyValue::String8(s) => Some(s.to_string()),
+                    PropertyValue::Unicode(s) => Some(s.to_string()),
+                    _ => None,
+                })
+            };
+
+            let message_class = get_str(0x001A)
+                .map(|s| s.to_ascii_uppercase())
+                .unwrap_or_else(|| "IPM.NOTE".to_string());
+            let subject = get_str(0x0037);
+            let sender = get_str(0x0C1A);
+            let to_recipients = get_str(0x0E04);
+            let cc_recipients = get_str(0x0E02);
+
+            let submit_time = props.get(0x0039).and_then(|v| match v {
+                PropertyValue::Time(t) => filetime_to_iso(*t),
+                _ => None,
+            });
+            let delivery_time = props.get(0x0E06).and_then(|v| match v {
+                PropertyValue::Time(t) => filetime_to_iso(*t),
+                _ => None,
+            });
+
+            let body_text = get_str(0x1000);
+
+            let body_html: Option<String> = props.get(0x1013).and_then(|v| match v {
+                PropertyValue::Binary(b) => {
+                    let s = String::from_utf8_lossy(b.buffer());
+                    if s.trim_start().starts_with('<') {
+                        Some(s.into_owned())
+                    } else {
+                        None
+                    }
+                }
+                PropertyValue::String8(s) => Some(s.to_string()),
+                PropertyValue::Unicode(s) => Some(s.to_string()),
+                _ => None,
+            });
+
+            let body_rtf: Option<Vec<u8>> = props.get(0x1009).and_then(|v| match v {
+                PropertyValue::Binary(b) => Some(b.buffer().to_vec()),
+                _ => None,
+            });
+
+            let attachment_count: i32 = props
+                .get(0x0E13)
+                .and_then(|v| match v {
+                    PropertyValue::Integer32(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0);
+
+            tx.execute(
+                "INSERT INTO messages (folder_id, message_class, subject, sender,
+                    to_recipients, cc_recipients, submit_time, delivery_time,
+                    body_text, body_html, body_rtf, attachment_count)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                &[
+                    &folder_id,
+                    &message_class,
+                    &subject,
+                    &sender,
+                    &to_recipients,
+                    &cc_recipients,
+                    &submit_time,
+                    &delivery_time,
+                    &body_text,
+                    &body_html,
+                    &body_rtf,
+                    &attachment_count,
+                ],
+            )?;
+            counts.1 += 1;
+        }
+    }
+
+    if let Some(hierarchy_table) = folder.hierarchy_table() {
+        for row in hierarchy_table.rows_matrix() {
+            if limit > 0 && counts.1 >= limit {
+                break;
+            }
+            let Ok(entry_id) = store
+                .properties()
+                .make_entry_id(NodeId::from(u32::from(row.id())))
+            else {
+                continue;
+            };
+            let Ok(subfolder) = UnicodeFolder::read(Rc::clone(&store), &entry_id) else {
+                continue;
+            };
+            export_folder_postgres(
+                Rc::clone(&store),
+                &subfolder,
+                Some(folder_id),
+                &path,
+                tx,
+                counts,
+                limit,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn export_pst_postgres(
+    file_path: &PathBuf,
+    connection: &str,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pst = UnicodePstFile::open(file_path)?;
+    let store = Rc::new(UnicodeStore::read(Rc::new(pst))?);
+    let ipm_sub_tree_entry_id = store.properties().ipm_sub_tree_entry_id()?;
+    let ipm_subtree_folder = UnicodeFolder::read(Rc::clone(&store), &ipm_sub_tree_entry_id)?;
+
+    let mut client = Client::connect(connection, NoTls)?;
+    create_export_schema_postgres(&mut client)?;
+
+    let mut counts: (usize, usize) = (0, 0);
+    let mut tx = client.transaction()?;
+    export_folder_postgres(
+        Rc::clone(&store),
+        &ipm_subtree_folder,
+        None,
+        "",
+        &mut tx,
+        &mut counts,
+        limit,
+    )?;
+    tx.commit()?;
+
+    println!("Exported to PostgreSQL");
     println!("  Folders:  {}", counts.0);
     println!("  Messages: {}", counts.1);
     Ok(())
@@ -3136,16 +3394,24 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Export {
-            file,
-            output,
-            limit,
-        } => {
-            if let Err(e) = export_pst(file, output.as_ref(), *limit) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+        Commands::Export { command } => match command.as_ref() {
+            ExportCommands::Sqlite { file, output, limit } => {
+                if let Err(e) = export_pst(file, output.as_ref(), *limit) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
             }
-        }
+            ExportCommands::Postgres {
+                file,
+                connection,
+                limit,
+            } => {
+                if let Err(e) = export_pst_postgres(file, connection, *limit) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
         Commands::Llm { command } => match command.as_ref() {
             LlmCommands::Embed {
                 file,
@@ -3707,6 +3973,143 @@ mod tests {
         assert_eq!(msg_count, 3, "expected exactly 3 messages with limit=3");
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // ── postgres export tests ─────────────────────────────────────────────────
+    //
+    // These tests require a running PostgreSQL instance.
+    // Start one with:  docker compose up -d
+    // Then run with:   cargo test -- --ignored
+    //
+    // Default connection string matches docker-compose.yml:
+    //   postgres://pstexplorer:pstexplorer@localhost:5433/pstexplorer
+
+    fn postgres_test_url() -> String {
+        std::env::var("POSTGRES_TEST_URL")
+            .unwrap_or_else(|_| {
+                "postgres://pstexplorer:pstexplorer@localhost:5433/pstexplorer".to_string()
+            })
+    }
+
+    fn drop_export_tables(client: &mut Client) {
+        // Drop in reverse dependency order; ignore errors if tables don't exist
+        let _ = client.batch_execute(
+            "DROP TABLE IF EXISTS attachments; DROP TABLE IF EXISTS messages; DROP TABLE IF EXISTS folders;",
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_postgres_export_sample_pst() {
+        let url = postgres_test_url();
+        let mut client = Client::connect(&url, NoTls).expect("failed to connect to postgres");
+        drop_export_tables(&mut client);
+        drop(client);
+
+        export_pst_postgres(&PathBuf::from("testdata/sample.pst"), &url, 0)
+            .expect("postgres export should succeed");
+
+        let mut client = Client::connect(&url, NoTls).unwrap();
+
+        let folder_count: i64 = client
+            .query_one("SELECT COUNT(*) FROM folders", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(folder_count, 5);
+
+        let msg_count: i64 = client
+            .query_one("SELECT COUNT(*) FROM messages", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(msg_count, 1);
+
+        let row = client
+            .query_one("SELECT subject, sender FROM messages LIMIT 1", &[])
+            .unwrap();
+        let subject: String = row.get(0);
+        let sender: String = row.get(1);
+        assert!(
+            subject.contains("Aspose.Email"),
+            "unexpected subject: {subject:?}"
+        );
+        assert_eq!(sender, "Sender Name");
+
+        drop_export_tables(&mut client);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_postgres_export_limit_zero_exports_all() {
+        let url = postgres_test_url();
+        let mut client = Client::connect(&url, NoTls).expect("failed to connect to postgres");
+        drop_export_tables(&mut client);
+        drop(client);
+
+        export_pst_postgres(&PathBuf::from("testdata/sample.pst"), &url, 0)
+            .expect("postgres export should succeed");
+
+        let mut client = Client::connect(&url, NoTls).unwrap();
+        let msg_count: i64 = client
+            .query_one("SELECT COUNT(*) FROM messages", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(msg_count, 1, "limit=0 should export all messages");
+
+        drop_export_tables(&mut client);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_postgres_export_testpst() {
+        let url = postgres_test_url();
+        let mut client = Client::connect(&url, NoTls).expect("failed to connect to postgres");
+        drop_export_tables(&mut client);
+        drop(client);
+
+        export_pst_postgres(&PathBuf::from("testdata/testPST.pst"), &url, 0)
+            .expect("postgres export should succeed");
+
+        let mut client = Client::connect(&url, NoTls).unwrap();
+
+        let folder_count: i64 = client
+            .query_one("SELECT COUNT(*) FROM folders", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(folder_count, 2);
+
+        let msg_count: i64 = client
+            .query_one("SELECT COUNT(*) FROM messages", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(msg_count, 6);
+
+        drop_export_tables(&mut client);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_postgres_export_limit_caps_message_count() {
+        let url = postgres_test_url();
+        let mut client = Client::connect(&url, NoTls).expect("failed to connect to postgres");
+        drop_export_tables(&mut client);
+        drop(client);
+
+        let limit: usize = 3;
+        export_pst_postgres(&PathBuf::from("testdata/testPST.pst"), &url, limit)
+            .expect("postgres export should succeed");
+
+        let mut client = Client::connect(&url, NoTls).unwrap();
+        let msg_count: i64 = client
+            .query_one("SELECT COUNT(*) FROM messages", &[])
+            .unwrap()
+            .get(0);
+        assert!(
+            msg_count <= limit as i64,
+            "exported {msg_count} messages but limit was {limit}"
+        );
+        assert_eq!(msg_count, 3, "expected exactly 3 messages with limit=3");
+
+        drop_export_tables(&mut client);
     }
 
     // ── FTM output tests ─────────────────────────────────────────────────────
