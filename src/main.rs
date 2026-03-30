@@ -11,6 +11,7 @@ use outlook_pst::{
     ndb::node_id::NodeId,
     *,
 };
+use postgres::{Client, NoTls};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -19,7 +20,6 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
 };
-use postgres::{Client, NoTls};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf, rc::Rc, time::Instant};
@@ -1639,8 +1639,8 @@ fn export_folder_postgres(
                 Rc::clone(&store),
                 &entry_id,
                 Some(&[
-                    0x0037, 0x001A, 0x0039, 0x0C1A, 0x0E02, 0x0E04, 0x0E06, 0x0E13, 0x1000,
-                    0x1009, 0x1013,
+                    0x0037, 0x001A, 0x0039, 0x0C1A, 0x0E02, 0x0E04, 0x0E06, 0x0E13, 0x1000, 0x1009,
+                    0x1013,
                 ]),
             ) {
                 Ok(m) => m,
@@ -3397,7 +3397,11 @@ fn main() {
             }
         }
         Commands::Export { command } => match command.as_ref() {
-            ExportCommands::Sqlite { file, output, limit } => {
+            ExportCommands::Sqlite {
+                file,
+                output,
+                limit,
+            } => {
                 if let Err(e) = export_pst(file, output.as_ref(), *limit) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
@@ -3987,10 +3991,9 @@ mod tests {
     //   postgres://pstexplorer:pstexplorer@localhost:5433/pstexplorer
 
     fn postgres_test_url() -> String {
-        std::env::var("POSTGRES_TEST_URL")
-            .unwrap_or_else(|_| {
-                "postgres://pstexplorer:pstexplorer@localhost:5433/pstexplorer".to_string()
-            })
+        std::env::var("POSTGRES_TEST_URL").unwrap_or_else(|_| {
+            "postgres://pstexplorer:pstexplorer@localhost:5433/pstexplorer".to_string()
+        })
     }
 
     fn drop_export_tables(client: &mut Client) {
