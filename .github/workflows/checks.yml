@@ -9,7 +9,21 @@ concurrency:
 jobs:
   ci:
     name: CI
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pstexplorer
+          POSTGRES_PASSWORD: pstexplorer
+          POSTGRES_DB: pstexplorer
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -18,14 +32,8 @@ jobs:
           toolchain: stable
           override: true
           components: rustfmt, clippy
-      - name: Start PostgreSQL
-        run: |
-          sudo apt-get install -y postgresql
-          sudo pg_ctlcluster $(pg_lsclusters -h | awk '{print $1, $2}') start
-          sudo -u postgres psql -c "CREATE USER pstexplorer WITH PASSWORD 'pstexplorer';"
-          sudo -u postgres psql -c "CREATE DATABASE pstexplorer OWNER pstexplorer;"
       - uses: j178/prek-action@v1
       - name: Run integration tests (postgres)
         env:
-          POSTGRES_TEST_URL: postgres://pstexplorer:pstexplorer@localhost:5432/pstexplorer
+          POSTGRES_TEST_URL: postgres://pstexplorer:pstexplorer@localhost:5433/pstexplorer
         run: cargo test -- --ignored
