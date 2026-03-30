@@ -20,7 +20,8 @@ jobs:
           components: rustfmt, clippy
       - name: Start PostgreSQL
         run: |
-          sudo systemctl start postgresql
+          sudo apt-get install -y postgresql
+          sudo pg_ctlcluster $(pg_lsclusters -h | awk '{print $1, $2}') start
           sudo -u postgres psql -c "CREATE USER pstexplorer WITH PASSWORD 'pstexplorer';"
           sudo -u postgres psql -c "CREATE DATABASE pstexplorer OWNER pstexplorer;"
       - uses: j178/prek-action@v1
