@@ -1,0 +1,43 @@
+src    := "PSTBrowser.swift"
+app    := "PSTBrowser.app"
+bundle := app + "/Contents/MacOS/PSTBrowser"
+sdk    := `xcrun --show-sdk-path --sdk macosx`
+
+swiftflags := "-parse-as-library -sdk " + sdk + \
+    " -framework SwiftUI -framework AppKit -framework WebKit -Xlinker -lsqlite3"
+
+# List available recipes
+default:
+    @just --list
+
+# Compile into a .app bundle
+build:
+    mkdir -p "{{ app }}/Contents/MacOS"
+    cp Info.plist "{{ app }}/Contents/Info.plist"
+    swiftc {{ swiftflags }} -o "{{ bundle }}" {{ src }}
+
+# Compile with optimisations
+build-release:
+    mkdir -p "{{ app }}/Contents/MacOS"
+    cp Info.plist "{{ app }}/Contents/Info.plist"
+    swiftc {{ swiftflags }} -O -o "{{ bundle }}" {{ src }}
+
+# Build and launch (open is required for SwiftUI window + run loop)
+run: build
+    open "{{ app }}"
+
+# Type-check without producing a binary
+check:
+    swiftc -typecheck -parse-as-library -sdk {{ sdk }} {{ src }}
+
+# Format source in-place with swift-format
+fmt:
+    swift-format format -i {{ src }}
+
+# Lint with swift-format (print diff, non-zero exit if changes needed)
+lint:
+    swift-format lint {{ src }}
+
+# Remove build artefacts
+clean:
+    rm -rf "{{ app }}"
