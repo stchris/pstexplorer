@@ -56,9 +56,17 @@ struct Attachment: Identifiable {
 final class Database: ObservableObject {
     @Published var folders: [Folder] = []
     @Published var messages: [Message] = []
+    @Published var hasMore = false
     @Published var error: String?
 
     private var db: OpaquePointer?
+    private let pageSize = 200
+
+    // Stored so loadNextPage() can fetch the next page without re-specifying params.
+    private var lastFolderId: Int64?
+    private var lastSearch  = ""
+    private var lastSort    = SortField.deliveryTime
+    private var lastAscending = false
 
     var isOpen: Bool { db != nil }
 
@@ -149,15 +157,28 @@ final class Database: ObservableObject {
     }
 
     func loadMessages(folderId: Int64?, search: String = "", sort: SortField = .deliveryTime, ascending: Bool = false) {
+        lastFolderId  = folderId
+        lastSearch    = search
+        lastSort      = sort
+        lastAscending = ascending
+        execute(offset: 0, appending: false)
+    }
+
+    func loadNextPage() {
+        guard hasMore else { return }
+        execute(offset: messages.count, appending: true)
+    }
+
+    private func execute(offset: Int, appending: Bool) {
         guard let db else { return }
         var conditions: [String] = []
         var bindings: [Any] = []
 
-        if let fid = folderId {
+        if let fid = lastFolderId {
             conditions.append("folder_id = ?")
             bindings.append(fid)
         }
-        let parsed = parseSearch(search)
+        let parsed = parseSearch(lastSearch)
         if let v = parsed.from     { conditions.append("sender LIKE ?");        bindings.append("%\(v)%") }
         if let v = parsed.to       { conditions.append("to_recipients LIKE ?"); bindings.append("%\(v)%") }
         if let v = parsed.cc       { conditions.append("cc_recipients LIKE ?"); bindings.append("%\(v)%") }
@@ -171,33 +192,34 @@ final class Database: ObservableObject {
 
         let where_ = conditions.isEmpty ? "" : "WHERE " + conditions.joined(separator: " AND ")
         let orderCol: String
-        switch sort {
+        switch lastSort {
         case .deliveryTime: orderCol = "delivery_time"
         case .submitTime:   orderCol = "submit_time"
         case .sender:       orderCol = "sender"
         case .recipient:    orderCol = "to_recipients"
         case .subject:      orderCol = "subject"
         }
-        let dir = ascending ? "ASC" : "DESC"
+        let dir = lastAscending ? "ASC" : "DESC"
         let sql = """
             SELECT id, folder_id, subject, sender, to_recipients, cc_recipients,
                    submit_time, delivery_time, body_text, body_html, attachment_count
             FROM messages \(where_)
             ORDER BY \(orderCol) \(dir)
+            LIMIT \(pageSize) OFFSET \(offset)
             """
 
-        log("loadMessages sql: \(sql.trimmingCharacters(in: .whitespacesAndNewlines))")
+        log("execute sql (offset=\(offset)): \(sql.trimmingCharacters(in: .whitespacesAndNewlines))")
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            log("loadMessages prepare failed: \(sqliteError())")
+            log("execute prepare failed: \(sqliteError())")
             return
         }
         defer { sqlite3_finalize(stmt) }
 
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         for (i, val) in bindings.enumerated() {
             let idx = Int32(i + 1)
             if let s = val as? String {
-                let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
                 sqlite3_bind_text(stmt, idx, (s as NSString).utf8String, -1, SQLITE_TRANSIENT)
             } else if let n = val as? Int64 {
                 sqlite3_bind_int64(stmt, idx, n)
@@ -230,8 +252,16 @@ final class Database: ObservableObject {
                 attachmentCount: Int(sqlite3_column_int(stmt, 10))
             ))
         }
-        log("loadMessages: loaded \(result.count) message(s)")
-        DispatchQueue.main.async { self.messages = result }
+        let more = result.count == pageSize
+        log("execute: got \(result.count) message(s), hasMore=\(more)")
+        DispatchQueue.main.async {
+            if appending {
+                self.messages.append(contentsOf: result)
+            } else {
+                self.messages = result
+            }
+            self.hasMore = more
+        }
     }
 
     func loadAttachments(messageId: Int64) -> [Attachment] {
@@ -384,7 +414,7 @@ struct ContentView: View {
                 TextField("Search… from: to: subject:", text: $search)
                     .frame(width: 180)
                     .textFieldStyle(.roundedBorder)
-                    .onChange(of: search) { reload() }
+                    .onSubmit { reload() }
             }
         }
         .onChange(of: sort)           { reload() }
@@ -435,6 +465,16 @@ struct ContentView: View {
                 MessageRowView(message: msg)
                     .tag(msg)
                     .listRowInsets(EdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10))
+                    .onAppear {
+                        if db.hasMore && msg == db.messages.last {
+                            db.loadNextPage()
+                        }
+                    }
+            }
+            if db.hasMore {
+                ProgressView()
+                    .frame(maxWidth: .infinity)
+                    .listRowSeparator(.hidden)
             }
         }
         .listStyle(.plain)
