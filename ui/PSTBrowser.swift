@@ -64,12 +64,28 @@ final class Database: ObservableObject {
 
     deinit { close() }
 
+    private func log(_ message: String) {
+        print("[PSTBrowser] \(message)")
+    }
+
+    private func sqliteError() -> String {
+        guard let db else { return "no connection" }
+        return String(cString: sqlite3_errmsg(db))
+    }
+
     func open(url: URL) {
         close()
-        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
-            error = "Cannot open database: \(url.lastPathComponent)"
+        // immutable=1: skip WAL/SHM files — safe for a read-only export viewer.
+        let uri = url.absoluteString + "?immutable=1"
+        log("Opening \(uri)")
+        let rc = sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil)
+        guard rc == SQLITE_OK else {
+            let msg = "Cannot open database: \(url.lastPathComponent) — \(sqliteError()) (rc=\(rc))"
+            log(msg)
+            error = msg
             return
         }
+        log("Opened successfully")
         loadFolders()
         loadMessages(folderId: nil)
     }
@@ -79,10 +95,13 @@ final class Database: ObservableObject {
     }
 
     func loadFolders() {
-        guard let db else { return }
+        guard let db else { log("loadFolders: no open db"); return }
         let sql = "SELECT id, parent_id, name, path FROM folders ORDER BY path"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            log("loadFolders prepare failed: \(sqliteError())")
+            return
+        }
         defer { sqlite3_finalize(stmt) }
         var result: [Folder] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -92,6 +111,7 @@ final class Database: ObservableObject {
             let path  = String(cString: sqlite3_column_text(stmt, 3))
             result.append(Folder(id: id, parentId: pid, name: name, path: path))
         }
+        log("loadFolders: loaded \(result.count) folder(s)")
         DispatchQueue.main.async { self.folders = result }
     }
 
@@ -166,8 +186,12 @@ final class Database: ObservableObject {
             ORDER BY \(orderCol) \(dir)
             """
 
+        log("loadMessages sql: \(sql.trimmingCharacters(in: .whitespacesAndNewlines))")
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            log("loadMessages prepare failed: \(sqliteError())")
+            return
+        }
         defer { sqlite3_finalize(stmt) }
 
         for (i, val) in bindings.enumerated() {
@@ -206,14 +230,18 @@ final class Database: ObservableObject {
                 attachmentCount: Int(sqlite3_column_int(stmt, 10))
             ))
         }
+        log("loadMessages: loaded \(result.count) message(s)")
         DispatchQueue.main.async { self.messages = result }
     }
 
     func loadAttachments(messageId: Int64) -> [Attachment] {
-        guard let db else { return [] }
+        guard let db else { log("loadAttachments: no open db"); return [] }
         let sql = "SELECT id, message_id, filename, content_type, size, data FROM attachments WHERE message_id = ?"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            log("loadAttachments prepare failed: \(sqliteError())")
+            return []
+        }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, messageId)
         var result: [Attachment] = []

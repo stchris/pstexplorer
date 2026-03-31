@@ -22,9 +22,13 @@ build-release:
     cp Info.plist "{{ app }}/Contents/Info.plist"
     swiftc {{ swiftflags }} -O -o "{{ bundle }}" {{ src }}
 
-# Build and launch (open is required for SwiftUI window + run loop)
+# Build and launch via open (detaches from terminal)
 run: build
     open "{{ app }}"
+
+# Build and run with stdout attached (shows log output)
+dev: build
+    "{{ bundle }}"
 
 # Type-check without producing a binary
 check:
