@@ -454,6 +454,7 @@ struct MessageDetailView: View {
     let message: Message
     let db: Database
     @State private var attachments: [Attachment] = []
+    @State private var showHtml: Bool = true
 
     var body: some View {
         ScrollView {
@@ -475,6 +476,7 @@ struct MessageDetailView: View {
         }
         .onChange(of: message) {
             attachments = message.attachmentCount > 0 ? db.loadAttachments(messageId: message.id) : []
+            showHtml = true
         }
     }
 
@@ -507,22 +509,33 @@ struct MessageDetailView: View {
     // MARK: Body
 
     private var bodySection: some View {
-        Group {
-            if let html = message.bodyHtml, !html.isEmpty {
-                WebView(html: html)
+        let hasHtml = !(message.bodyHtml ?? "").isEmpty
+        let hasText = !(message.bodyText ?? "").isEmpty
+        return VStack(alignment: .trailing, spacing: 8) {
+            if hasHtml && hasText {
+                Picker("View", selection: $showHtml) {
+                    Text("HTML").tag(true)
+                    Text("Plain text").tag(false)
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .padding(.top, 8)
+            }
+            if hasHtml && showHtml {
+                WebView(html: message.bodyHtml!)
                     .frame(minHeight: 300)
-            } else if let text = message.bodyText, !text.isEmpty {
-                Text(text)
+            } else if hasText {
+                Text(message.bodyText!)
                     .font(.body)
                     .textSelection(.enabled)
-                    .padding(.top, 12)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 Text("(no content)")
                     .foregroundColor(.secondary)
-                    .padding(.top, 12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .padding(.top, 8)
     }
 
     // MARK: Attachments
