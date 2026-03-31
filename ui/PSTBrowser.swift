@@ -95,7 +95,7 @@ final class Database: ObservableObject {
         DispatchQueue.main.async { self.folders = result }
     }
 
-    func loadMessages(folderId: Int64?, search: String = "", sort: SortField = .date, ascending: Bool = false) {
+    func loadMessages(folderId: Int64?, search: String = "", sort: SortField = .deliveryTime, ascending: Bool = false) {
         guard let db else { return }
         var conditions: [String] = []
         var bindings: [Any] = []
@@ -113,10 +113,11 @@ final class Database: ObservableObject {
         let where_ = conditions.isEmpty ? "" : "WHERE " + conditions.joined(separator: " AND ")
         let orderCol: String
         switch sort {
-        case .sender:    orderCol = "sender"
-        case .recipient: orderCol = "to_recipients"
-        case .date:      orderCol = "COALESCE(delivery_time, submit_time)"
-        case .subject:   orderCol = "subject"
+        case .deliveryTime: orderCol = "delivery_time"
+        case .submitTime:   orderCol = "submit_time"
+        case .sender:       orderCol = "sender"
+        case .recipient:    orderCol = "to_recipients"
+        case .subject:      orderCol = "subject"
         }
         let dir = ascending ? "ASC" : "DESC"
         let sql = """
@@ -200,10 +201,11 @@ final class Database: ObservableObject {
 // MARK: - Sort
 
 enum SortField: String, CaseIterable, Identifiable {
-    case date      = "Date"
-    case sender    = "Sender"
-    case recipient = "Recipient"
-    case subject   = "Subject"
+    case deliveryTime = "Received"
+    case submitTime   = "Sent"
+    case sender       = "Sender"
+    case recipient    = "Recipient"
+    case subject      = "Subject"
     var id: Self { self }
 }
 
@@ -229,7 +231,7 @@ struct ContentView: View {
     @State private var selectedFolder: Folder?
     @State private var selectedMessage: Message?
     @State private var search = ""
-    @State private var sort: SortField = .date
+    @State private var sort: SortField = .deliveryTime
     @State private var ascending = false
     @State private var showOpenPanel = false
     @State private var sidebarWidth: CGFloat = 200
@@ -491,9 +493,13 @@ struct MessageDetailView: View {
             if !message.ccRecipients.isEmpty {
                 HeaderRow(label: "CC",  value: message.ccRecipients)
             }
-            if let date = message.deliveryTime ?? message.submitTime {
-                HeaderRow(label: "Date", value: fullDateFormatter.string(from: date))
+            if let date = message.submitTime {
+                HeaderRow(label: "Sent", value: fullDateFormatter.string(from: date))
             }
+            if let date = message.deliveryTime {
+                HeaderRow(label: "Received", value: fullDateFormatter.string(from: date))
+            }
+            HeaderRow(label: "ID", value: String(message.id))
         }
         .padding(.bottom, 12)
     }
@@ -554,7 +560,7 @@ struct HeaderRow: View {
             Text(label + ":")
                 .font(.subheadline.bold())
                 .foregroundColor(.secondary)
-                .frame(width: 52, alignment: .trailing)
+                .frame(width: 68, alignment: .trailing)
             Text(value)
                 .font(.subheadline)
                 .textSelection(.enabled)
