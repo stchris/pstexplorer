@@ -95,6 +95,39 @@ final class Database: ObservableObject {
         DispatchQueue.main.async { self.folders = result }
     }
 
+    private struct ParsedSearch {
+        var from: String?
+        var to: String?
+        var cc: String?
+        var subject: String?
+        var id: Int64?
+        var hasAttachment = false
+        var freeText: String?
+    }
+
+    private func parseSearch(_ raw: String) -> ParsedSearch {
+        var p = ParsedSearch()
+        var remaining: [String] = []
+        for token in raw.split(separator: " ").map(String.init) {
+            let lower = token.lowercased()
+            if lower.hasPrefix("from:"),        let v = tokenValue(token, prefix: 5) { p.from = v }
+            else if lower.hasPrefix("to:"),     let v = tokenValue(token, prefix: 3) { p.to = v }
+            else if lower.hasPrefix("cc:"),     let v = tokenValue(token, prefix: 3) { p.cc = v }
+            else if lower.hasPrefix("subject:"), let v = tokenValue(token, prefix: 8) { p.subject = v }
+            else if lower.hasPrefix("id:"),     let v = tokenValue(token, prefix: 3) { p.id = Int64(v) }
+            else if lower == "has:attachment" { p.hasAttachment = true }
+            else { remaining.append(token) }
+        }
+        let ft = remaining.joined(separator: " ")
+        p.freeText = ft.isEmpty ? nil : ft
+        return p
+    }
+
+    private func tokenValue(_ token: String, prefix: Int) -> String? {
+        let v = String(token.dropFirst(prefix))
+        return v.isEmpty ? nil : v
+    }
+
     func loadMessages(folderId: Int64?, search: String = "", sort: SortField = .deliveryTime, ascending: Bool = false) {
         guard let db else { return }
         var conditions: [String] = []
@@ -104,10 +137,16 @@ final class Database: ObservableObject {
             conditions.append("folder_id = ?")
             bindings.append(fid)
         }
-        if !search.isEmpty {
+        let parsed = parseSearch(search)
+        if let v = parsed.from     { conditions.append("sender LIKE ?");        bindings.append("%\(v)%") }
+        if let v = parsed.to       { conditions.append("to_recipients LIKE ?"); bindings.append("%\(v)%") }
+        if let v = parsed.cc       { conditions.append("cc_recipients LIKE ?"); bindings.append("%\(v)%") }
+        if let v = parsed.subject  { conditions.append("subject LIKE ?");       bindings.append("%\(v)%") }
+        if let v = parsed.id       { conditions.append("id = ?");               bindings.append(v) }
+        if parsed.hasAttachment    { conditions.append("attachment_count > 0") }
+        if let v = parsed.freeText {
             conditions.append("(subject LIKE ? OR sender LIKE ? OR to_recipients LIKE ? OR body_text LIKE ?)")
-            let term = "%\(search)%"
-            bindings += [term, term, term, term]
+            let t = "%\(v)%"; bindings += [t, t, t, t]
         }
 
         let where_ = conditions.isEmpty ? "" : "WHERE " + conditions.joined(separator: " AND ")
@@ -134,7 +173,8 @@ final class Database: ObservableObject {
         for (i, val) in bindings.enumerated() {
             let idx = Int32(i + 1)
             if let s = val as? String {
-                sqlite3_bind_text(stmt, idx, (s as NSString).utf8String, -1, nil)
+                let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                sqlite3_bind_text(stmt, idx, (s as NSString).utf8String, -1, SQLITE_TRANSIENT)
             } else if let n = val as? Int64 {
                 sqlite3_bind_int64(stmt, idx, n)
             }
@@ -313,10 +353,10 @@ struct ContentView: View {
                 }
             }
             ToolbarItem(placement: .primaryAction) {
-                TextField("Search…", text: $search)
+                TextField("Search… from: to: subject:", text: $search)
                     .frame(width: 180)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { reload() }
+                    .onChange(of: search) { reload() }
             }
         }
         .onChange(of: sort)           { reload() }
