@@ -63,10 +63,19 @@ final class Database: ObservableObject {
     private let pageSize = 200
 
     // Stored so loadNextPage() can fetch the next page without re-specifying params.
-    private var lastFolderId: Int64?
-    private var lastSearch  = ""
-    private var lastSort    = SortField.deliveryTime
+    private var lastFolderId:  Int64?
+    private var lastSearch    = ""
+    private var lastSort      = SortField.deliveryTime
     private var lastAscending = false
+    private var lastFromDate:  Date? = nil
+    private var lastToDate:    Date? = nil
+
+    private static let sqlDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.timeZone = TimeZone(identifier: "UTC")
+        return f
+    }()
 
     var isOpen: Bool { db != nil }
 
@@ -156,11 +165,14 @@ final class Database: ObservableObject {
         return v.isEmpty ? nil : v
     }
 
-    func loadMessages(folderId: Int64?, search: String = "", sort: SortField = .deliveryTime, ascending: Bool = false) {
+    func loadMessages(folderId: Int64?, search: String = "", sort: SortField = .deliveryTime,
+                      ascending: Bool = false, fromDate: Date? = nil, toDate: Date? = nil) {
         lastFolderId  = folderId
         lastSearch    = search
         lastSort      = sort
         lastAscending = ascending
+        lastFromDate  = fromDate
+        lastToDate    = toDate
         execute(offset: 0, appending: false)
     }
 
@@ -188,6 +200,16 @@ final class Database: ObservableObject {
         if let v = parsed.freeText {
             conditions.append("(subject LIKE ? OR sender LIKE ? OR to_recipients LIKE ? OR body_text LIKE ?)")
             let t = "%\(v)%"; bindings += [t, t, t, t]
+        }
+        if let d = lastFromDate {
+            conditions.append("COALESCE(delivery_time, submit_time) >= ?")
+            bindings.append(Self.sqlDateFormatter.string(from: d))
+        }
+        if let d = lastToDate {
+            // Use start of the following day so the entire toDate is included.
+            let next = Calendar.current.date(byAdding: .day, value: 1, to: d) ?? d
+            conditions.append("COALESCE(delivery_time, submit_time) < ?")
+            bindings.append(Self.sqlDateFormatter.string(from: next))
         }
 
         let where_ = conditions.isEmpty ? "" : "WHERE " + conditions.joined(separator: " AND ")
@@ -331,6 +353,8 @@ struct ContentView: View {
     @State private var search = ""
     @State private var sort: SortField = .deliveryTime
     @State private var ascending = false
+    @State private var fromDate: Date? = nil
+    @State private var toDate: Date? = nil
     @State private var showOpenPanel = false
     @State private var sidebarWidth: CGFloat = 200
 
@@ -419,6 +443,8 @@ struct ContentView: View {
         }
         .onChange(of: sort)           { reload() }
         .onChange(of: selectedFolder) { reload() }
+        .onChange(of: fromDate)       { reload() }
+        .onChange(of: toDate)         { reload() }
     }
 
     // MARK: Sidebar
@@ -459,6 +485,31 @@ struct ContentView: View {
 
     // MARK: Message list
 
+    private var dateFilterBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "calendar")
+                .foregroundColor(.secondary)
+                .font(.caption)
+            OptionalDatePicker(label: "From", date: $fromDate)
+            Text("→")
+                .foregroundColor(.secondary)
+                .font(.caption)
+            OptionalDatePicker(label: "To", date: $toDate)
+            if fromDate != nil || toDate != nil {
+                Button { fromDate = nil; toDate = nil } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Color(.windowBackgroundColor))
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
     private var messageListView: some View {
         List(selection: $selectedMessage) {
             ForEach(db.messages) { msg in
@@ -479,6 +530,7 @@ struct ContentView: View {
         }
         .listStyle(.plain)
         .navigationTitle(selectedFolder?.name ?? "All Mail")
+        .safeAreaInset(edge: .top, spacing: 0) { dateFilterBar }
         .overlay {
             if db.messages.isEmpty {
                 Text("No messages")
@@ -490,7 +542,8 @@ struct ContentView: View {
     // MARK: Helpers
 
     private func reload() {
-        db.loadMessages(folderId: selectedFolder?.id, search: search, sort: sort, ascending: ascending)
+        db.loadMessages(folderId: selectedFolder?.id, search: search, sort: sort,
+                        ascending: ascending, fromDate: fromDate, toDate: toDate)
         selectedMessage = nil
     }
 
@@ -504,6 +557,42 @@ struct ContentView: View {
             db.open(url: url)
             selectedFolder = nil
             selectedMessage = nil
+            fromDate = nil
+            toDate   = nil
+        }
+    }
+}
+
+// MARK: - Optional Date Picker
+
+struct OptionalDatePicker: View {
+    let label: String
+    @Binding var date: Date?
+
+    var body: some View {
+        if let d = date {
+            HStack(spacing: 2) {
+                DatePicker(
+                    "",
+                    selection: Binding(get: { d }, set: { date = $0 }),
+                    displayedComponents: .date
+                )
+                .datePickerStyle(.compact)
+                .labelsHidden()
+                .fixedSize()
+
+                Button { date = nil } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        } else {
+            Button(label) { date = Date() }
+                .buttonStyle(.plain)
+                .foregroundColor(.accentColor)
+                .font(.subheadline)
         }
     }
 }
